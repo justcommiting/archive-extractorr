@@ -211,12 +211,19 @@ impl ArchiveExtractorApp {
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let theme_label = if self.show_dark_theme { "Dark" } else { "Light" };
-                let btn = egui::Button::new(theme_label)
-                    .min_size(egui::vec2(50.0, 24.0));
+                let theme_label = if self.show_dark_theme {
+                    "Dark"
+                } else {
+                    "Light"
+                };
+                let btn = egui::Button::new(theme_label).min_size(egui::vec2(50.0, 24.0));
                 if ui.add(btn).clicked() {
                     self.show_dark_theme = !self.show_dark_theme;
-                    let theme = if self.show_dark_theme { Theme::Dark } else { Theme::Light };
+                    let theme = if self.show_dark_theme {
+                        Theme::Dark
+                    } else {
+                        Theme::Light
+                    };
                     theme.apply(ui.ctx());
                 }
             });
@@ -233,12 +240,18 @@ impl ArchiveExtractorApp {
                 ui.vertical(|ui| {
                     if let Some(ref path) = self.archive_path {
                         ui.label(
-                            egui::RichText::new(path.file_name().unwrap_or_default().to_string_lossy())
-                                .size(16.0)
-                                .color(egui::Color32::WHITE),
+                            egui::RichText::new(
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                            )
+                            .size(16.0)
+                            .color(egui::Color32::WHITE),
                         );
                         if let Some(fmt) = self.archive_format {
-                            let mut info_text = format!("{} {}", formats::format_icon(fmt), formats::format_name(fmt));
+                            let mut info_text = format!(
+                                "{} {}",
+                                formats::format_icon(fmt),
+                                formats::format_name(fmt)
+                            );
                             if self.is_encrypted {
                                 info_text.push_str(" 🔒");
                             }
@@ -260,7 +273,10 @@ impl ArchiveExtractorApp {
                 ui.add_space(20.0);
 
                 // Right: Destination (only show when archive is loaded and not extracting)
-                if self.archive_path.is_some() && !self.is_extracting && self.extraction_progress < 100.0 {
+                if self.archive_path.is_some()
+                    && !self.is_extracting
+                    && self.extraction_progress < 100.0
+                {
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new("Extract to:")
@@ -293,11 +309,13 @@ impl ArchiveExtractorApp {
             // Password field (only for encrypted archives)
             if self.is_encrypted && !self.is_extracting && self.extraction_progress < 100.0 {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Password:")
-                            .size(12.0)
-                            .color(if self.password_error { egui::Color32::from_rgb(220, 80, 80) } else { egui::Color32::GRAY }),
-                    );
+                    ui.label(egui::RichText::new("Password:").size(12.0).color(
+                        if self.password_error {
+                            egui::Color32::from_rgb(220, 80, 80)
+                        } else {
+                            egui::Color32::GRAY
+                        },
+                    ));
 
                     let password_edit = egui::TextEdit::singleline(&mut self.password)
                         .password(true)
@@ -320,7 +338,7 @@ impl ArchiveExtractorApp {
                     ui.add(
                         egui::ProgressBar::new(self.extraction_progress / 100.0)
                             .show_percentage()
-                            .text(&self.extraction_status)
+                            .text(&self.extraction_status),
                     );
 
                     if self.is_extracting && ui.button("Cancel").clicked() {
@@ -355,8 +373,7 @@ impl ArchiveExtractorApp {
 
                     ui.add_space(10.0);
 
-                    let btn = egui::Button::new("Extract")
-                        .min_size(egui::vec2(80.0, 28.0));
+                    let btn = egui::Button::new("Extract").min_size(egui::vec2(80.0, 28.0));
 
                     if ui.add(btn).clicked() {
                         self.start_extraction();
@@ -410,10 +427,21 @@ impl ArchiveExtractorApp {
 
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(icon).size(16.0));
-                            ui.label(egui::RichText::new(&entry.name).size(13.0).color(egui::Color32::WHITE));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new(size).size(11.0).color(egui::Color32::from_rgb(120, 120, 120)));
-                            });
+                            ui.label(
+                                egui::RichText::new(&entry.name)
+                                    .size(13.0)
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(size)
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(120, 120, 120)),
+                                    );
+                                },
+                            );
                         });
                     }
                 });
@@ -426,7 +454,11 @@ impl ArchiveExtractorApp {
             ui.vertical(|ui| {
                 ui.add_space(50.0);
 
-                ui.label(egui::RichText::new("Drop archive here").size(24.0).color(egui::Color32::WHITE));
+                ui.label(
+                    egui::RichText::new("Drop archive here")
+                        .size(24.0)
+                        .color(egui::Color32::WHITE),
+                );
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("Drop archive here")

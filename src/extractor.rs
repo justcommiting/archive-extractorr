@@ -154,7 +154,9 @@ pub fn extract_zip(
             }
         };
 
-        let entry_path = entry.enclosed_name().unwrap_or_else(|| Path::new(entry.name()));
+        let entry_path = entry
+            .enclosed_name()
+            .unwrap_or_else(|| Path::new(entry.name()));
         let out_path = dest.join(entry_path);
 
         if entry.name().ends_with('/') {
@@ -164,12 +166,15 @@ pub fn extract_zip(
             }
         } else {
             if let Some(parent) = out_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent).context("Failed to create parent directory") {
+                if let Err(e) =
+                    fs::create_dir_all(parent).context("Failed to create parent directory")
+                {
                     error!("Failed to create parent directory {:?}: {}", parent, e);
                     continue;
                 }
             }
-            let mut outfile = match File::create(&out_path).context("Failed to create output file") {
+            let mut outfile = match File::create(&out_path).context("Failed to create output file")
+            {
                 Ok(f) => f,
                 Err(e) => {
                     error!("Failed to create output file {:?}: {}", out_path, e);
@@ -240,7 +245,11 @@ pub fn extract_gzip(
     let file = File::open(path).context("Failed to open GZIP file")?;
     let mut decoder = GzDecoder::new(file);
 
-    let mut output_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut output_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     if output_name.ends_with(".gz") {
         output_name = output_name[..output_name.len() - 3].to_string();
     }
@@ -252,8 +261,12 @@ pub fn extract_gzip(
     let mut outfile = File::create(&out_path).context("Failed to create output file")?;
 
     let mut buffer = Vec::new();
-    decoder.read_to_end(&mut buffer).context("Failed to decompress")?;
-    outfile.write_all(&buffer).context("Failed to write output")?;
+    decoder
+        .read_to_end(&mut buffer)
+        .context("Failed to decompress")?;
+    outfile
+        .write_all(&buffer)
+        .context("Failed to write output")?;
 
     total.store(1, Ordering::Relaxed);
 
@@ -276,7 +289,11 @@ pub fn extract_bzip2(
     let file = File::open(path).context("Failed to open BZIP2 file")?;
     let mut decoder = bzip2::read::BzDecoder::new(file);
 
-    let mut output_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut output_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     if output_name.ends_with(".bz2") {
         output_name = output_name[..output_name.len() - 4].to_string();
     }
@@ -288,8 +305,12 @@ pub fn extract_bzip2(
     let mut outfile = File::create(&out_path).context("Failed to create output file")?;
 
     let mut buffer = Vec::new();
-    decoder.read_to_end(&mut buffer).context("Failed to decompress")?;
-    outfile.write_all(&buffer).context("Failed to write output")?;
+    decoder
+        .read_to_end(&mut buffer)
+        .context("Failed to decompress")?;
+    outfile
+        .write_all(&buffer)
+        .context("Failed to write output")?;
 
     total.store(1, Ordering::Relaxed);
 
@@ -312,7 +333,11 @@ pub fn extract_xz(
     let file = File::open(path).context("Failed to open XZ file")?;
     let mut decoder = XzDecoder::new(file);
 
-    let mut output_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut output_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     if output_name.ends_with(".xz") {
         output_name = output_name[..output_name.len() - 3].to_string();
     }
@@ -324,8 +349,12 @@ pub fn extract_xz(
     let mut outfile = File::create(&out_path).context("Failed to create output file")?;
 
     let mut buffer = Vec::new();
-    decoder.read_to_end(&mut buffer).context("Failed to decompress")?;
-    outfile.write_all(&buffer).context("Failed to write output")?;
+    decoder
+        .read_to_end(&mut buffer)
+        .context("Failed to decompress")?;
+    outfile
+        .write_all(&buffer)
+        .context("Failed to write output")?;
 
     total.store(1, Ordering::Relaxed);
 
@@ -345,7 +374,9 @@ pub fn extract_rar(
 
     // Open for listing first to count entries
     let archive = RarArchive::new(&path_str);
-    let mut list_archive = archive.open_for_listing().context("Failed to open RAR archive")?;
+    let mut list_archive = archive
+        .open_for_listing()
+        .context("Failed to open RAR archive")?;
     let entries: Vec<_> = list_archive.by_ref().filter_map(|e| e.ok()).collect();
     total.store(entries.len(), Ordering::Relaxed);
 
@@ -356,7 +387,9 @@ pub fn extract_rar(
         RarArchive::new(&path_str)
     };
 
-    let mut process_archive = archive.open_for_processing().context("Failed to open RAR for processing")?;
+    let mut process_archive = archive
+        .open_for_processing()
+        .context("Failed to open RAR for processing")?;
 
     let mut extracted = 0;
 
@@ -416,7 +449,10 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
                     is_dir: entry.name().ends_with('/'),
                     size: entry.size(),
                     compressed_size: entry.compressed_size(),
-                    path: entry.enclosed_name().unwrap_or_else(|| Path::new(entry.name())).to_path_buf(),
+                    path: entry
+                        .enclosed_name()
+                        .unwrap_or_else(|| Path::new(entry.name()))
+                        .to_path_buf(),
                 });
             }
             Ok(entries)
@@ -444,7 +480,11 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
             let file = File::open(path)?;
             let metadata = file.metadata()?;
             Ok(vec![ArchiveEntry {
-                name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 is_dir: false,
                 size: metadata.len(),
                 compressed_size: metadata.len(),
@@ -454,7 +494,9 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
         ArchiveFormat::Rar => {
             let path_str = path.to_string_lossy().to_string();
             let archive = RarArchive::new(&path_str);
-            let mut list_archive = archive.open_for_listing().context("Failed to open RAR archive")?;
+            let mut list_archive = archive
+                .open_for_listing()
+                .context("Failed to open RAR archive")?;
             let mut entries = Vec::new();
 
             for entry_result in list_archive.by_ref() {
@@ -507,56 +549,98 @@ mod tests {
 
     #[test]
     fn test_archive_format_from_extension() {
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.zip")), ArchiveFormat::Zip);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.tar")), ArchiveFormat::Tar);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.gz")), ArchiveFormat::Gzip);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.gzip")), ArchiveFormat::Gzip);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.bz2")), ArchiveFormat::Bzip2);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.xz")), ArchiveFormat::Xz);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.rar")), ArchiveFormat::Rar);
-        assert_eq!(ArchiveFormat::from_extension(Path::new("test.unknown")), ArchiveFormat::Unknown);
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.zip")),
+            ArchiveFormat::Zip
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.tar")),
+            ArchiveFormat::Tar
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.gz")),
+            ArchiveFormat::Gzip
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.gzip")),
+            ArchiveFormat::Gzip
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.bz2")),
+            ArchiveFormat::Bzip2
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.xz")),
+            ArchiveFormat::Xz
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.rar")),
+            ArchiveFormat::Rar
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension(Path::new("test.unknown")),
+            ArchiveFormat::Unknown
+        );
     }
 
     #[test]
     fn test_archive_format_from_magic_bytes_zip() {
         // ZIP magic bytes: 50 4B 03 04
         let data = vec![0x50, 0x4B, 0x03, 0x04, 0x00, 0x00];
-        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Zip));
+        assert_eq!(
+            ArchiveFormat::from_magic_bytes(&data),
+            Some(ArchiveFormat::Zip)
+        );
     }
 
     #[test]
     fn test_archive_format_from_magic_bytes_gzip() {
         // GZIP magic bytes: 1F 8B
         let data = vec![0x1F, 0x8B, 0x08, 0x00];
-        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Gzip));
+        assert_eq!(
+            ArchiveFormat::from_magic_bytes(&data),
+            Some(ArchiveFormat::Gzip)
+        );
     }
 
     #[test]
     fn test_archive_format_from_magic_bytes_bzip2() {
         // BZIP2 magic bytes: 42 5A 68
         let data = vec![0x42, 0x5A, 0x68, 0x39];
-        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Bzip2));
+        assert_eq!(
+            ArchiveFormat::from_magic_bytes(&data),
+            Some(ArchiveFormat::Bzip2)
+        );
     }
 
     #[test]
     fn test_archive_format_from_magic_bytes_xz() {
         // XZ magic bytes: FD 37 7A 58 5A 00
         let data = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
-        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Xz));
+        assert_eq!(
+            ArchiveFormat::from_magic_bytes(&data),
+            Some(ArchiveFormat::Xz)
+        );
     }
 
     #[test]
     fn test_archive_format_from_magic_bytes_rar_v15() {
         // RAR v1.5 magic bytes: 52 61 72 21 1A 07 00
         let data = vec![0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
-        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Rar));
+        assert_eq!(
+            ArchiveFormat::from_magic_bytes(&data),
+            Some(ArchiveFormat::Rar)
+        );
     }
 
     #[test]
     fn test_archive_format_from_magic_bytes_rar_v20() {
         // RAR v2.0 magic bytes: 52 61 72 21 1A 07 01 00
         let data = vec![0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
-        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Rar));
+        assert_eq!(
+            ArchiveFormat::from_magic_bytes(&data),
+            Some(ArchiveFormat::Rar)
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use egui::{Color32, Visuals, Rounding, Spacing, Stroke, Vec2};
+use egui::{Color32, Rounding, Spacing, Stroke, Vec2, Visuals};
 
 /// Application theme
 #[derive(Clone, Copy, Debug, PartialEq)]
