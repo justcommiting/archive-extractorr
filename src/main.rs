@@ -1,18 +1,53 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cli;
 mod extractor;
 mod formats;
 mod ui;
 
-use app::ArchiveExtractorApp;
-use eframe::egui;
+fn main() {
+    use clap::Parser;
 
-fn main() -> eframe::Result<()> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp(None)
+        .format_target(false)
+        .init();
 
-    log::info!("Starting Archive Extractor");
+    let args: Vec<String> = std::env::args().collect();
+
+    // If no CLI arguments, run GUI mode
+    if args.len() == 1 {
+        #[cfg(feature = "gui")]
+        {
+            if let Err(e) = run_gui() {
+                eprintln!("GUI Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("GUI feature not enabled. Use --help for CLI options.");
+            std::process::exit(1);
+        }
+    } else {
+        // Run CLI mode
+        let cli = cli::Cli::parse();
+
+        if let Err(e) = cli::run(cli) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+fn run_gui() -> eframe::Result<()> {
+    use app::ArchiveExtractorApp;
+    use eframe::egui;
+
+    log::info!("Starting Archive Extractor GUI");
 
     // Try to load icon, fall back to default if not available
     let icon_data = include_bytes!("../assets/icon.png");

@@ -8,9 +8,8 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
-# GUI Framework
-eframe = { version = "0.29", default-features = true }
-egui = "0.29"
+# CLI
+clap = { version = "4.5", features = ["derive"] }
 
 # Archive formats
 zip = "0.6"
@@ -20,20 +19,24 @@ bzip2 = "0.4"
 xz2 = "0.1"
 unrar = "0.5"  # RAR support (requires libunrar)
 
-# File dialogs
-rfd = "0.15"
-
 # Logging
 log = "0.4"
 env_logger = "0.11"
 
-# Async and utilities
-parking_lot = "0.12"
-open = "5.3"
-
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+# GUI Framework (optional for CLI-only builds)
+eframe = { version = "0.29", default-features = true, optional = true }
+egui = { version = "0.29", optional = true }
+rfd = { version = "0.15", optional = true }
+open = { version = "5.3", optional = true }
+parking_lot = { version = "0.12", optional = true }
+
+[features]
+default = ["gui"]
+gui = ["eframe", "egui", "rfd", "open", "parking_lot"]
 
 [dev-dependencies]
 tempfile = "3.10"

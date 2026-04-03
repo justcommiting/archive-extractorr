@@ -47,12 +47,41 @@ Pre-built binaries are available for:
 
 ## Usage
 
+### GUI Mode
+
+Run without arguments to launch the graphical interface:
+
+```bash
+./target/release/archive-extractor
+```
+
 1. **Open an Archive**: Click "Open Archive" or drag and drop an archive file
 2. **Browse Contents**: View the files inside the archive
 3. **Select Destination**: Choose where to extract files
 4. **Extract**: Click the "Extract" button to extract all files
 
-### Keyboard Shortcuts
+### CLI Mode
+
+The CLI supports three commands:
+
+```bash
+# Extract an archive
+archive-extractor extract archive.zip -o /path/to/destination
+
+# List archive contents
+archive-extractor list archive.zip
+
+# Show archive information
+archive-extractor info archive.zip
+
+# Extract with password for encrypted archives
+archive-extractor extract protected.zip -p mypassword
+
+# Verbose output
+archive-extractor extract archive.zip -v
+```
+
+### Keyboard Shortcuts (GUI)
 
 | Shortcut | Action |
 |----------|--------|
@@ -89,14 +118,14 @@ cargo build --release --target x86_64-unknown-linux-gnu
 archive-extractor/
 ├── Cargo.toml          # Project dependencies
 ├── src/
-│   ├── main.rs         # Application entry point
+│   ├── main.rs         # Application entry point (GUI + CLI)
 │   ├── app.rs          # Main application logic
+│   ├── cli.rs          # Command-line interface
 │   ├── extractor.rs    # Archive extraction engine
 │   ├── formats.rs      # Format detection and utilities
 │   └── ui/
 │       ├── mod.rs      # UI module exports
-│       ├── theme.rs    # Theme configuration
-│       └── widgets.rs  # Custom UI widgets
+│       └── theme.rs    # Theme configuration
 ├── assets/
 │   └── icon.png        # Application icon
 └── README.md
