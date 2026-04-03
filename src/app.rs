@@ -526,20 +526,24 @@ impl eframe::App for ArchiveExtractorApp {
         }
 
         // Ctrl/Cmd+D: Select destination
-        if input.key_pressed(egui::Key::D) && (input.modifiers.ctrl || input.modifiers.command) {
-            if self.archive_path.is_some() && !self.is_extracting {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.destination_path = Some(path.clone());
-                    self.destination_edit = path.display().to_string();
-                }
+        if input.key_pressed(egui::Key::D)
+            && (input.modifiers.ctrl || input.modifiers.command)
+            && self.archive_path.is_some()
+            && !self.is_extracting
+        {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                self.destination_path = Some(path.clone());
+                self.destination_edit = path.display().to_string();
             }
         }
 
         // Ctrl/Cmd+E: Extract
-        if input.key_pressed(egui::Key::E) && (input.modifiers.ctrl || input.modifiers.command) {
-            if self.archive_path.is_some() && !self.is_extracting {
-                self.start_extraction();
-            }
+        if input.key_pressed(egui::Key::E)
+            && (input.modifiers.ctrl || input.modifiers.command)
+            && self.archive_path.is_some()
+            && !self.is_extracting
+        {
+            self.start_extraction();
         }
 
         // Ctrl/Cmd+Q: Quit
