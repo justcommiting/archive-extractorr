@@ -72,29 +72,9 @@ pub fn format_size(size: u64) -> String {
         s if s < KB => format!("{} B", s),
         s if s < MB => format!("{:.1} KB", s as f64 / KB as f64),
         s if s < GB => format!("{:.1} MB", s as f64 / MB as f64),
-        s if s < GB => format!("{:.1} GB", s as f64 / GB as f64),
+        s if s < TB => format!("{:.1} GB", s as f64 / GB as f64),
         s => format!("{:.1} TB", s as f64 / TB as f64),
     }
-}
-
-/// Filter entries by search text (unused, kept for future use)
-#[allow(dead_code)]
-pub fn filter_entries<'a>(entries: &'a [ArchiveEntry], search: &str) -> Vec<&'a ArchiveEntry> {
-    if search.is_empty() {
-        return entries.iter().collect();
-    }
-
-    let search_lower = search.to_lowercase();
-    entries
-        .iter()
-        .filter(|e| e.name.to_lowercase().contains(&search_lower))
-        .collect()
-}
-
-/// Calculate total size of entries (unused, kept for future use)
-#[allow(dead_code)]
-pub fn total_size(entries: &[ArchiveEntry]) -> u64 {
-    entries.iter().map(|e| e.size).sum()
 }
 
 /// Check if a path is a supported archive
