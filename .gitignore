@@ -1,0 +1,52 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust analyzer
+.rust-analyzer/
+
+# Environment files
+.env
+.env.local
+
+# Build output
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Debug files
+*.pdb
+
+# Profiling
+*.profraw
+*.profdata
+
+# Coverage
+*.gcno
+*.gcda
+coverage/
+tarpaulin-report.html
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs
+*.log
+
+# Test files
+test_output/
