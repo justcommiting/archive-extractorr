@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
+use log::error;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -118,7 +119,7 @@ impl ArchiveFormat {
 pub fn extract_zip(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     password: Option<&str>,
@@ -157,16 +158,32 @@ pub fn extract_zip(
         let out_path = dest.join(entry_path);
 
         if entry.name().ends_with('/') {
-            fs::create_dir_all(&out_path).context("Failed to create directory")?;
+            if let Err(e) = fs::create_dir_all(&out_path).context("Failed to create directory") {
+                error!("Failed to create directory {:?}: {}", out_path, e);
+                continue;
+            }
         } else {
             if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).context("Failed to create parent directory")?;
+                if let Err(e) = fs::create_dir_all(parent).context("Failed to create parent directory") {
+                    error!("Failed to create parent directory {:?}: {}", parent, e);
+                    continue;
+                }
             }
-            let mut outfile = File::create(&out_path).context("Failed to create output file")?;
-            io::copy(&mut entry, &mut outfile).context("Failed to extract file")?;
+            let mut outfile = match File::create(&out_path).context("Failed to create output file") {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Failed to create output file {:?}: {}", out_path, e);
+                    continue;
+                }
+            };
+            if let Err(e) = io::copy(&mut entry, &mut outfile).context("Failed to extract file") {
+                error!("Failed to extract file {:?}: {}", out_path, e);
+                continue;
+            }
         }
 
         extracted += 1;
+        progress.fetch_add(1, Ordering::Relaxed);
     }
 
     Ok(extracted)
@@ -480,5 +497,85 @@ pub fn extract_archive(
         ArchiveFormat::Xz => extract_xz(path, dest, progress, total, cancel_flag, password),
         ArchiveFormat::Rar => extract_rar(path, dest, progress, total, cancel_flag, password),
         ArchiveFormat::Unknown => anyhow::bail!("Unknown archive format"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_archive_format_from_extension() {
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.zip")), ArchiveFormat::Zip);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.tar")), ArchiveFormat::Tar);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.gz")), ArchiveFormat::Gzip);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.gzip")), ArchiveFormat::Gzip);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.bz2")), ArchiveFormat::Bzip2);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.xz")), ArchiveFormat::Xz);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.rar")), ArchiveFormat::Rar);
+        assert_eq!(ArchiveFormat::from_extension(Path::new("test.unknown")), ArchiveFormat::Unknown);
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_zip() {
+        // ZIP magic bytes: 50 4B 03 04
+        let data = vec![0x50, 0x4B, 0x03, 0x04, 0x00, 0x00];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Zip));
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_gzip() {
+        // GZIP magic bytes: 1F 8B
+        let data = vec![0x1F, 0x8B, 0x08, 0x00];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Gzip));
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_bzip2() {
+        // BZIP2 magic bytes: 42 5A 68
+        let data = vec![0x42, 0x5A, 0x68, 0x39];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Bzip2));
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_xz() {
+        // XZ magic bytes: FD 37 7A 58 5A 00
+        let data = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Xz));
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_rar_v15() {
+        // RAR v1.5 magic bytes: 52 61 72 21 1A 07 00
+        let data = vec![0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Rar));
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_rar_v20() {
+        // RAR v2.0 magic bytes: 52 61 72 21 1A 07 01 00
+        let data = vec![0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), Some(ArchiveFormat::Rar));
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_empty() {
+        let data: Vec<u8> = vec![];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), None);
+    }
+
+    #[test]
+    fn test_archive_format_from_magic_bytes_unknown() {
+        let data = vec![0x00, 0x01, 0x02, 0x03];
+        assert_eq!(ArchiveFormat::from_magic_bytes(&data), None);
+    }
+
+    #[test]
+    fn test_create_temp_dir_for_extraction() {
+        let temp_dir = TempDir::new().unwrap();
+        let dest = temp_dir.path().join("output");
+        fs::create_dir_all(&dest).unwrap();
+        assert!(dest.exists());
     }
 }

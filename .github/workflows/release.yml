@@ -11,6 +11,30 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features
+
   build-windows:
     runs-on: windows-latest
 
@@ -135,7 +159,7 @@ jobs:
           path: archive-extractor-linux-x86_64.tar.gz
 
   create-release:
-    needs: [build-windows, build-macos, build-linux]
+    needs: [lint, build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write

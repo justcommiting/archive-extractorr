@@ -269,6 +269,7 @@ dependencies = [
  "parking_lot",
  "rfd",
  "tar",
+ "tempfile",
  "thiserror 1.0.69",
  "unrar",
  "xz2",

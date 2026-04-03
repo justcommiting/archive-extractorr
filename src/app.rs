@@ -480,6 +480,46 @@ impl eframe::App for ArchiveExtractorApp {
             ctx.request_repaint();
         }
 
+        // Keyboard shortcuts
+        let input = ctx.input(|i| i.clone());
+
+        // Ctrl/Cmd+O: Open archive
+        if input.key_pressed(egui::Key::O) && (input.modifiers.ctrl || input.modifiers.command) {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Archive", formats::supported_extensions())
+                .pick_file()
+            {
+                self.set_archive(path);
+            }
+        }
+
+        // Ctrl/Cmd+D: Select destination
+        if input.key_pressed(egui::Key::D) && (input.modifiers.ctrl || input.modifiers.command) {
+            if self.archive_path.is_some() && !self.is_extracting {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.destination_path = Some(path.clone());
+                    self.destination_edit = path.display().to_string();
+                }
+            }
+        }
+
+        // Ctrl/Cmd+E: Extract
+        if input.key_pressed(egui::Key::E) && (input.modifiers.ctrl || input.modifiers.command) {
+            if self.archive_path.is_some() && !self.is_extracting {
+                self.start_extraction();
+            }
+        }
+
+        // Ctrl/Cmd+Q: Quit
+        if input.key_pressed(egui::Key::Q) && (input.modifiers.ctrl || input.modifiers.command) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Escape: Cancel extraction
+        if input.key_pressed(egui::Key::Escape) && self.is_extracting {
+            self.cancel_flag.store(true, Ordering::Relaxed);
+        }
+
         // Handle drag and drop
         if let Some(payload) = ctx.input(|i| i.raw.dropped_files.first().cloned()) {
             if let Some(path) = payload.path {

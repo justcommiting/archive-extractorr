@@ -88,3 +88,139 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "zip", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "lzma", "rar",
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_name() {
+        assert_eq!(format_name(ArchiveFormat::Zip), "ZIP Archive");
+        assert_eq!(format_name(ArchiveFormat::Tar), "TAR Archive");
+        assert_eq!(format_name(ArchiveFormat::Gzip), "GZIP Compressed");
+        assert_eq!(format_name(ArchiveFormat::Bzip2), "BZIP2 Compressed");
+        assert_eq!(format_name(ArchiveFormat::Xz), "XZ Compressed");
+        assert_eq!(format_name(ArchiveFormat::Rar), "RAR Archive");
+        assert_eq!(format_name(ArchiveFormat::Unknown), "Unknown Format");
+    }
+
+    #[test]
+    fn test_format_icon() {
+        assert_eq!(format_icon(ArchiveFormat::Zip), "📦");
+        assert_eq!(format_icon(ArchiveFormat::Rar), "📦");
+        assert_eq!(format_icon(ArchiveFormat::Tar), "📋");
+        assert_eq!(format_icon(ArchiveFormat::Unknown), "❓");
+    }
+
+    #[test]
+    fn test_file_icon_directories() {
+        let dir_entry = ArchiveEntry {
+            name: "folder".to_string(),
+            is_dir: true,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("folder").to_path_buf(),
+        };
+        assert_eq!(file_icon(&dir_entry), "📁");
+    }
+
+    #[test]
+    fn test_file_icon_extensions() {
+        let txt_entry = ArchiveEntry {
+            name: "file.txt".to_string(),
+            is_dir: false,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("file.txt").to_path_buf(),
+        };
+        assert_eq!(file_icon(&txt_entry), "📄");
+
+        let pdf_entry = ArchiveEntry {
+            name: "document.pdf".to_string(),
+            is_dir: false,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("document.pdf").to_path_buf(),
+        };
+        assert_eq!(file_icon(&pdf_entry), "📕");
+
+        let jpg_entry = ArchiveEntry {
+            name: "photo.jpg".to_string(),
+            is_dir: false,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("photo.jpg").to_path_buf(),
+        };
+        assert_eq!(file_icon(&jpg_entry), "🖼️");
+
+        let mp3_entry = ArchiveEntry {
+            name: "song.mp3".to_string(),
+            is_dir: false,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("song.mp3").to_path_buf(),
+        };
+        assert_eq!(file_icon(&mp3_entry), "🎵");
+
+        let mp4_entry = ArchiveEntry {
+            name: "video.mp4".to_string(),
+            is_dir: false,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("video.mp4").to_path_buf(),
+        };
+        assert_eq!(file_icon(&mp4_entry), "🎬");
+
+        let rs_entry = ArchiveEntry {
+            name: "code.rs".to_string(),
+            is_dir: false,
+            size: 0,
+            compressed_size: 0,
+            path: Path::new("code.rs").to_path_buf(),
+        };
+        assert_eq!(file_icon(&rs_entry), "⚙️");
+    }
+
+    #[test]
+    fn test_format_size_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1), "1 B");
+        assert_eq!(format_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn test_format_size_kilobytes() {
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(1048575), "1024.0 KB");
+    }
+
+    #[test]
+    fn test_format_size_megabytes() {
+        assert_eq!(format_size(1048576), "1.0 MB");
+        assert_eq!(format_size(1572864), "1.5 MB");
+        assert_eq!(format_size(1073741823), "1024.0 MB");
+    }
+
+    #[test]
+    fn test_format_size_gigabytes() {
+        assert_eq!(format_size(1073741824), "1.0 GB");
+        assert_eq!(format_size(1610612736), "1.5 GB");
+        assert_eq!(format_size(1099511627775), "1024.0 GB");
+    }
+
+    #[test]
+    fn test_format_size_terabytes() {
+        assert_eq!(format_size(1099511627776), "1.0 TB");
+        assert_eq!(format_size(1649267441664), "1.5 TB");
+    }
+
+    #[test]
+    fn test_supported_extensions() {
+        let extensions = supported_extensions();
+        assert!(extensions.contains(&"zip"));
+        assert!(extensions.contains(&"tar"));
+        assert!(extensions.contains(&"gz"));
+        assert!(extensions.contains(&"rar"));
+    }
+}

@@ -4,6 +4,7 @@ A cross-platform archive extractor with a modern, beautiful GUI built with Rust 
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
+![Tests](https://github.com/justcommiting/archive-extractorr/workflows/Release/badge.svg)
 
 ## Features
 
@@ -53,10 +54,13 @@ Pre-built binaries are available for:
 
 ### Keyboard Shortcuts
 
-- `Ctrl+O` / `Cmd+O`: Open archive
-- `Ctrl+D` / `Cmd+D`: Select destination folder
-- `Ctrl+E` / `Cmd+E`: Extract
-- `Ctrl+Q` / `Cmd+Q`: Quit
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+O` / `Cmd+O` | Open archive |
+| `Ctrl+D` / `Cmd+D` | Select destination folder |
+| `Ctrl+E` / `Cmd+E` | Extract |
+| `Ctrl+Q` / `Cmd+Q` | Quit |
+| `Escape` | Cancel extraction |
 
 ## Building for Production
 
@@ -114,7 +118,11 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for reporting security vulnerabilities.
 
 ## Acknowledgments
 
