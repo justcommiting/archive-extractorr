@@ -123,15 +123,14 @@ impl ArchiveExtractorApp {
         self.archive_entries.iter().map(|e| e.size).sum()
     }
 
-    fn filtered_entries_owned(&self) -> Vec<ArchiveEntry> {
+    fn filtered_entries_owned(&self) -> Vec<&ArchiveEntry> {
         if self.search_query.is_empty() {
-            return self.archive_entries.clone();
+            return self.archive_entries.iter().collect();
         }
         let search_lower = self.search_query.to_lowercase();
         self.archive_entries
             .iter()
             .filter(|e| e.name.to_lowercase().contains(&search_lower))
-            .cloned()
             .collect()
     }
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use log::error;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -175,7 +175,7 @@ pub fn extract_zip(
             }
             let mut outfile = match File::create(&out_path).context("Failed to create output file")
             {
-                Ok(f) => f,
+                Ok(f) => BufWriter::new(f),
                 Err(e) => {
                     error!("Failed to create output file {:?}: {}", out_path, e);
                     continue;
@@ -198,22 +198,13 @@ pub fn extract_zip(
 pub fn extract_tar(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
 ) -> Result<usize> {
     let file = File::open(path).context("Failed to open TAR file")?;
-    let mut archive = Archive::new(file);
-
-    // Count entries first
-    let entries: Vec<_> = archive
-        .entries()
-        .context("Failed to read archive entries")?
-        .filter_map(|e| e.ok())
-        .collect();
-    total.store(entries.len(), Ordering::Relaxed);
-
+    let mut archive = Archive::new(BufReader::new(file));
     let mut extracted = 0;
 
     for entry in archive.entries().context("Failed to read entries")? {
@@ -224,8 +215,10 @@ pub fn extract_tar(
         let mut entry = entry.context("Failed to read entry")?;
         entry.unpack_in(dest).context("Failed to extract entry")?;
         extracted += 1;
+        progress.fetch_add(1, Ordering::Relaxed);
     }
 
+    total.store(extracted, Ordering::Relaxed);
     Ok(extracted)
 }
 
@@ -258,15 +251,11 @@ pub fn extract_gzip(
     }
 
     let out_path = dest.join(&output_name);
-    let mut outfile = File::create(&out_path).context("Failed to create output file")?;
+    let mut outfile = BufWriter::new(File::create(&out_path).context("Failed to create output file")?);
 
-    let mut buffer = Vec::new();
-    decoder
-        .read_to_end(&mut buffer)
-        .context("Failed to decompress")?;
-    outfile
-        .write_all(&buffer)
-        .context("Failed to write output")?;
+    io::copy(&mut decoder, &mut outfile)
+        .context("Failed to decompress and write output")?;
+    outfile.flush().context("Failed to flush output")?;
 
     total.store(1, Ordering::Relaxed);
 
@@ -302,15 +291,11 @@ pub fn extract_bzip2(
     }
 
     let out_path = dest.join(&output_name);
-    let mut outfile = File::create(&out_path).context("Failed to create output file")?;
+    let mut outfile = BufWriter::new(File::create(&out_path).context("Failed to create output file")?);
 
-    let mut buffer = Vec::new();
-    decoder
-        .read_to_end(&mut buffer)
-        .context("Failed to decompress")?;
-    outfile
-        .write_all(&buffer)
-        .context("Failed to write output")?;
+    io::copy(&mut decoder, &mut outfile)
+        .context("Failed to decompress and write output")?;
+    outfile.flush().context("Failed to flush output")?;
 
     total.store(1, Ordering::Relaxed);
 
@@ -346,15 +331,11 @@ pub fn extract_xz(
     }
 
     let out_path = dest.join(&output_name);
-    let mut outfile = File::create(&out_path).context("Failed to create output file")?;
+    let mut outfile = BufWriter::new(File::create(&out_path).context("Failed to create output file")?);
 
-    let mut buffer = Vec::new();
-    decoder
-        .read_to_end(&mut buffer)
-        .context("Failed to decompress")?;
-    outfile
-        .write_all(&buffer)
-        .context("Failed to write output")?;
+    io::copy(&mut decoder, &mut outfile)
+        .context("Failed to decompress and write output")?;
+    outfile.flush().context("Failed to flush output")?;
 
     total.store(1, Ordering::Relaxed);
 
