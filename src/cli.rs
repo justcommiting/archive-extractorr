@@ -214,6 +214,10 @@ fn format_name(format: ArchiveFormat) -> &'static str {
         ArchiveFormat::Gzip => "GZIP",
         ArchiveFormat::Bzip2 => "BZIP2",
         ArchiveFormat::Xz => "XZ",
+        ArchiveFormat::SevenZip => "7z",
+        ArchiveFormat::Zstd => "ZSTD",
+        ArchiveFormat::Brotli => "BROTLI",
+        ArchiveFormat::Lz4 => "LZ4",
         ArchiveFormat::Rar => "RAR",
         ArchiveFormat::Unknown => "Unknown",
     }

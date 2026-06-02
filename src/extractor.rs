@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
+use brotli::Decompressor as BrotliDecoder;
 use flate2::read::GzDecoder;
 use log::error;
+use lz4_flex::frame::FrameDecoder as Lz4Decoder;
+use sevenz_rust::SevenZArchiveEntry;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tar::Archive;
 use unrar::Archive as RarArchive;
 use xz2::read::XzDecoder;
 use zip::ZipArchive;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 /// Archive entry information
 #[derive(Clone, Debug)]
@@ -48,6 +52,10 @@ pub enum ArchiveFormat {
     Bzip2,
     Xz,
     Rar,
+    SevenZip,
+    Zstd,
+    Brotli,
+    Lz4,
     Unknown,
 }
 
@@ -60,6 +68,10 @@ impl ArchiveFormat {
             "bz2" | "bzip2" => ArchiveFormat::Bzip2,
             "xz" | "lzma" => ArchiveFormat::Xz,
             "rar" => ArchiveFormat::Rar,
+            "7z" | "7zip" => ArchiveFormat::SevenZip,
+            "zst" | "zstd" => ArchiveFormat::Zstd,
+            "br" | "brotli" => ArchiveFormat::Brotli,
+            "lz4" => ArchiveFormat::Lz4,
             _ => ArchiveFormat::Unknown,
         }
     }
@@ -91,6 +103,22 @@ impl ArchiveFormat {
         // TAR: ustar at offset 257
         if data.len() >= 262 && data[257..262] == [0x75, 0x73, 0x74, 0x61, 0x72] {
             return Some(ArchiveFormat::Tar);
+        }
+        // 7z: 37 7A BC AF 27 1C
+        if data.len() >= 6 && data[0..6] == [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
+            return Some(ArchiveFormat::SevenZip);
+        }
+        // Zstandard: 28 B5 2F FD
+        if data.len() >= 4 && data[0..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            return Some(ArchiveFormat::Zstd);
+        }
+        // LZ4 frame: 04 22 4D 18
+        if data.len() >= 4 && data[0..4] == [0x04, 0x22, 0x4D, 0x18] {
+            return Some(ArchiveFormat::Lz4);
+        }
+        // LZ4 legacy: 02 21 4C 18
+        if data.len() >= 4 && data[0..4] == [0x02, 0x21, 0x4C, 0x18] {
+            return Some(ArchiveFormat::Lz4);
         }
         None
     }
@@ -342,6 +370,173 @@ pub fn extract_xz(
     Ok(1)
 }
 
+/// Extract a 7z archive
+pub fn extract_sevenzip(
+    path: &Path,
+    dest: &Path,
+    _progress: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+    cancel_flag: Arc<AtomicBool>,
+    _password: Option<&str>,
+) -> Result<usize> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        anyhow::bail!("Extraction cancelled");
+    }
+
+    // decompress_file extracts the entire 7z archive to dest preserving internal paths
+    sevenz_rust::decompress_file(path, dest)
+        .context("Failed to extract 7z archive")?;
+
+    // Count the extracted entries for progress reporting
+    let entry_count = count_extracted_files(dest);
+    total.store(entry_count, Ordering::Relaxed);
+
+    Ok(entry_count)
+}
+
+/// Count files in an extraction directory (used for 7z post-extraction counting)
+fn count_extracted_files(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                count += count_extracted_files(&entry.path());
+            } else {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Extract a Zstandard file
+pub fn extract_zstd(
+    path: &Path,
+    dest: &Path,
+    _progress: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+    cancel_flag: Arc<AtomicBool>,
+    _password: Option<&str>,
+) -> Result<usize> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        anyhow::bail!("Extraction cancelled");
+    }
+
+    let file = File::open(path).context("Failed to open Zstandard file")?;
+    let mut decoder = ZstdDecoder::new(file).context("Failed to create Zstandard decoder")?;
+
+    let mut output_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if output_name.ends_with(".zst") {
+        output_name = output_name[..output_name.len() - 4].to_string();
+    } else if output_name.ends_with(".zstd") {
+        output_name = output_name[..output_name.len() - 5].to_string();
+    }
+    if output_name.is_empty() {
+        output_name = "output".to_string();
+    }
+
+    let out_path = dest.join(&output_name);
+    let mut outfile = BufWriter::new(
+        File::create(&out_path).context("Failed to create output file")?,
+    );
+
+    io::copy(&mut decoder, &mut outfile)
+        .context("Failed to decompress and write output")?;
+    outfile.flush().context("Failed to flush output")?;
+
+    total.store(1, Ordering::Relaxed);
+
+    Ok(1)
+}
+
+/// Extract a Brotli file
+pub fn extract_brotli(
+    path: &Path,
+    dest: &Path,
+    _progress: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+    cancel_flag: Arc<AtomicBool>,
+    _password: Option<&str>,
+) -> Result<usize> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        anyhow::bail!("Extraction cancelled");
+    }
+
+    let file = File::open(path).context("Failed to open Brotli file")?;
+    let mut decoder = BrotliDecoder::new(file, 4096);
+
+    let mut output_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if output_name.ends_with(".br") {
+        output_name = output_name[..output_name.len() - 3].to_string();
+    }
+    if output_name.is_empty() {
+        output_name = "output".to_string();
+    }
+
+    let out_path = dest.join(&output_name);
+    let mut outfile = BufWriter::new(
+        File::create(&out_path).context("Failed to create output file")?,
+    );
+
+    io::copy(&mut decoder, &mut outfile)
+        .context("Failed to decompress and write output")?;
+    outfile.flush().context("Failed to flush output")?;
+
+    total.store(1, Ordering::Relaxed);
+
+    Ok(1)
+}
+
+/// Extract an LZ4 file
+pub fn extract_lz4(
+    path: &Path,
+    dest: &Path,
+    _progress: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+    cancel_flag: Arc<AtomicBool>,
+    _password: Option<&str>,
+) -> Result<usize> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        anyhow::bail!("Extraction cancelled");
+    }
+
+    let file = File::open(path).context("Failed to open LZ4 file")?;
+    let mut decoder = Lz4Decoder::new(file);
+
+    let mut output_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if output_name.ends_with(".lz4") {
+        output_name = output_name[..output_name.len() - 4].to_string();
+    }
+    if output_name.is_empty() {
+        output_name = "output".to_string();
+    }
+
+    let out_path = dest.join(&output_name);
+    let mut outfile = BufWriter::new(
+        File::create(&out_path).context("Failed to create output file")?,
+    );
+
+    io::copy(&mut decoder, &mut outfile)
+        .context("Failed to decompress and write output")?;
+    outfile.flush().context("Failed to flush output")?;
+
+    total.store(1, Ordering::Relaxed);
+
+    Ok(1)
+}
+
 /// Extract a RAR archive
 pub fn extract_rar(
     path: &Path,
@@ -457,7 +652,7 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
             }
             Ok(entries)
         }
-        ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz => {
+        ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd | ArchiveFormat::Brotli | ArchiveFormat::Lz4 => {
             let file = File::open(path)?;
             let metadata = file.metadata()?;
             Ok(vec![ArchiveEntry {
@@ -471,6 +666,48 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
                 compressed_size: metadata.len(),
                 path: path.to_path_buf(),
             }])
+        }
+        ArchiveFormat::SevenZip => {
+            let file = File::open(path)?;
+            let metadata = file.metadata()?;
+            let temp_dir = std::env::temp_dir().join("archive-extractor-7z-list");
+            let _ = fs::remove_dir_all(&temp_dir);
+            let mut entries = Vec::new();
+            let path_clone = path.to_path_buf();
+            let _ = sevenz_rust::decompress_file_with_extract_fn(
+                &path_clone,
+                &temp_dir,
+                &mut |entry: &SevenZArchiveEntry, reader: &mut dyn Read, _dest: &PathBuf| -> Result<bool, sevenz_rust::Error> {
+                    let name = entry.name().to_string();
+                    entries.push(ArchiveEntry {
+                        name: name.clone(),
+                        is_dir: entry.is_directory(),
+                        size: entry.size(),
+                        compressed_size: 0,
+                        path: std::path::Path::new(&name).to_path_buf(),
+                    });
+                    // Skip actual extraction by draining the reader
+                    let mut buf = [0u8; 8192];
+                    while reader.read(&mut buf).unwrap_or(0) > 0 {}
+                    Ok(false)
+                },
+            );
+            let _ = fs::remove_dir_all(&temp_dir);
+            if entries.is_empty() {
+                Ok(vec![ArchiveEntry {
+                    name: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    is_dir: false,
+                    size: metadata.len(),
+                    compressed_size: metadata.len(),
+                    path: path.to_path_buf(),
+                }])
+            } else {
+                Ok(entries)
+            }
         }
         ArchiveFormat::Rar => {
             let path_str = path.to_string_lossy().to_string();
@@ -518,6 +755,10 @@ pub fn extract_archive(
         ArchiveFormat::Gzip => extract_gzip(path, dest, progress, total, cancel_flag, password),
         ArchiveFormat::Bzip2 => extract_bzip2(path, dest, progress, total, cancel_flag, password),
         ArchiveFormat::Xz => extract_xz(path, dest, progress, total, cancel_flag, password),
+        ArchiveFormat::SevenZip => extract_sevenzip(path, dest, progress, total, cancel_flag, password),
+        ArchiveFormat::Zstd => extract_zstd(path, dest, progress, total, cancel_flag, password),
+        ArchiveFormat::Brotli => extract_brotli(path, dest, progress, total, cancel_flag, password),
+        ArchiveFormat::Lz4 => extract_lz4(path, dest, progress, total, cancel_flag, password),
         ArchiveFormat::Rar => extract_rar(path, dest, progress, total, cancel_flag, password),
         ArchiveFormat::Unknown => anyhow::bail!("Unknown archive format"),
     }

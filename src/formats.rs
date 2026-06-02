@@ -10,6 +10,10 @@ pub fn format_name(format: ArchiveFormat) -> &'static str {
         ArchiveFormat::Bzip2 => "BZIP2 Compressed",
         ArchiveFormat::Xz => "XZ Compressed",
         ArchiveFormat::Rar => "RAR Archive",
+        ArchiveFormat::SevenZip => "7z Archive",
+        ArchiveFormat::Zstd => "Zstandard Compressed",
+        ArchiveFormat::Brotli => "Brotli Compressed",
+        ArchiveFormat::Lz4 => "LZ4 Compressed",
         ArchiveFormat::Unknown => "Unknown Format",
     }
 }
@@ -23,6 +27,10 @@ pub fn format_icon(format: ArchiveFormat) -> &'static str {
         ArchiveFormat::Bzip2 => "🗜️",
         ArchiveFormat::Xz => "🗜️",
         ArchiveFormat::Rar => "📦",
+        ArchiveFormat::SevenZip => "🗜️",
+        ArchiveFormat::Zstd => "⚡",
+        ArchiveFormat::Brotli => "🥨",
+        ArchiveFormat::Lz4 => "💨",
         ArchiveFormat::Unknown => "❓",
     }
 }
@@ -49,7 +57,7 @@ pub fn file_icon(entry: &ArchiveEntry) -> &'static str {
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "svg" | "webp" => "🖼️",
         "mp3" | "wav" | "flac" | "aac" | "ogg" => "🎵",
         "mp4" | "avi" | "mkv" | "mov" | "webm" => "🎬",
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => "📦",
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "zstd" | "br" | "lz4" => "📦",
         "exe" | "msi" | "app" | "dmg" => "⚙️",
         "sh" | "bash" | "zsh" | "fish" => "🔧",
         "py" => "🐍",
@@ -86,6 +94,7 @@ pub fn is_supported_archive(path: &Path) -> bool {
 pub fn supported_extensions() -> &'static [&'static str] {
     &[
         "zip", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "lzma", "rar",
+        "7z", "7zip", "zst", "zstd", "br", "brotli", "lz4",
     ]
 }
 
@@ -101,6 +110,10 @@ mod tests {
         assert_eq!(format_name(ArchiveFormat::Bzip2), "BZIP2 Compressed");
         assert_eq!(format_name(ArchiveFormat::Xz), "XZ Compressed");
         assert_eq!(format_name(ArchiveFormat::Rar), "RAR Archive");
+        assert_eq!(format_name(ArchiveFormat::SevenZip), "7z Archive");
+        assert_eq!(format_name(ArchiveFormat::Zstd), "Zstandard Compressed");
+        assert_eq!(format_name(ArchiveFormat::Brotli), "Brotli Compressed");
+        assert_eq!(format_name(ArchiveFormat::Lz4), "LZ4 Compressed");
         assert_eq!(format_name(ArchiveFormat::Unknown), "Unknown Format");
     }
 

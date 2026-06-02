@@ -18,6 +18,10 @@ flate2 = "1.0"
 bzip2 = "0.4"
 xz2 = "0.1"
 unrar = "0.5"  # RAR support (requires libunrar)
+zstd = { version = "0.13", default-features = false }
+brotli = "8.0"
+lz4_flex = { version = "0.13", features = ["frame"] }
+sevenz-rust = "0.6"
 
 # Logging
 log = "0.4"
