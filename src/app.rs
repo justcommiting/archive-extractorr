@@ -5,7 +5,7 @@ use eframe::egui;
 use log::{error, info};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Application state
@@ -29,6 +29,7 @@ pub struct ArchiveExtractorApp {
     password: String,
     password_error: bool,
     show_password: bool,
+    error_message: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for ArchiveExtractorApp {
@@ -53,6 +54,7 @@ impl Default for ArchiveExtractorApp {
             password: String::new(),
             password_error: false,
             show_password: false,
+            error_message: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -76,9 +78,11 @@ impl ArchiveExtractorApp {
         match self.archive_format {
             Some(format) => {
                 // Check for encryption
-                if format == ArchiveFormat::Zip {
-                    self.is_encrypted = extractor::is_zip_encrypted(&path);
-                }
+                self.is_encrypted = match format {
+                    ArchiveFormat::Zip => extractor::is_zip_encrypted(&path),
+                    ArchiveFormat::Rar => extractor::is_rar_encrypted(&path),
+                    _ => false,
+                };
 
                 self.status_message = format!(
                     "Loaded {} · {}",
@@ -154,6 +158,7 @@ impl ArchiveExtractorApp {
         let progress_current = Arc::clone(&self.progress_current);
         let progress_total = Arc::clone(&self.progress_total);
         let cancel_flag = Arc::clone(&self.cancel_flag);
+        let error_message = Arc::clone(&self.error_message);
 
         self.is_extracting = true;
         self.extraction_progress = 0.0;
@@ -162,11 +167,13 @@ impl ArchiveExtractorApp {
         self.progress_current.store(0, Ordering::Relaxed);
         self.progress_total.store(0, Ordering::Relaxed);
         self.password_error = false;
+        // Clear any previous errors
+        *error_message.lock().unwrap() = None;
 
         info!("Starting extraction to {:?}", dest_path);
 
         let handle = thread::spawn(move || {
-            let _ = extractor::extract_archive(
+            let result = extractor::extract_archive(
                 &archive_path,
                 &dest_path,
                 progress_current,
@@ -174,6 +181,11 @@ impl ArchiveExtractorApp {
                 cancel_flag,
                 password.as_deref(),
             );
+            if let Err(e) = result {
+                let err_str = format!("{:#}", e);
+                error!("Extraction failed: {}", err_str);
+                *error_message.lock().unwrap() = Some(err_str);
+            }
         });
 
         self.extraction_handle = Some(handle);
@@ -196,9 +208,35 @@ impl ArchiveExtractorApp {
             if handle.is_finished() {
                 self.is_extracting = false;
                 self.extraction_handle = None;
-                self.extraction_progress = 100.0;
-                self.extraction_status = String::from("Done!");
-                self.status_message = String::from("Extraction complete");
+
+                // Check if there was an error
+                let err = self.error_message.lock().unwrap().take();
+                if let Some(err_msg) = err {
+                    let err_lower = err_msg.to_lowercase();
+                    let is_password_err = err_lower.contains("password")
+                        || err_lower.contains("invalid password")
+                        || err_lower.contains("decrypt");
+
+                    if is_password_err {
+                        // Password error — allow retry
+                        self.password_error = true;
+                        self.extraction_progress = 0.0;
+                        self.extraction_status = String::from("Extraction failed");
+                        self.status_message = format!("✗ Error: {}", err_msg);
+                        error!("Password error: {}", err_msg);
+                    } else {
+                        // Other error — show message but keep progress visible
+                        self.extraction_progress = 100.0;
+                        self.extraction_status = String::from("Failed");
+                        self.status_message = format!("✗ Error: {}", err_msg);
+                        error!("Extraction failed: {}", err_msg);
+                    }
+                } else {
+                    // Success
+                    self.extraction_progress = 100.0;
+                    self.extraction_status = String::from("Done!");
+                    self.status_message = String::from("Extraction complete");
+                }
             }
         }
     }

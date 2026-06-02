@@ -43,6 +43,25 @@ pub fn is_zip_encrypted(path: &Path) -> bool {
     false
 }
 
+/// Check if a RAR archive is password protected
+pub fn is_rar_encrypted(path: &Path) -> bool {
+    let path_str = path.to_string_lossy().to_string();
+    if let Ok(mut archive) = RarArchive::new(&path_str).open_for_listing() {
+        // If we can list entries without a password, it's not encrypted
+        for entry in archive.by_ref().filter_map(|e| e.ok()) {
+            // Check if entry has encryption flags
+            if entry.is_encrypted() {
+                return true;
+            }
+        }
+        false
+    } else {
+        // If opening for listing fails, it might be encrypted (RAR returns error
+        // when listing an encrypted archive without password)
+        true
+    }
+}
+
 /// Supported archive formats
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArchiveFormat {
