@@ -28,6 +28,7 @@ pub struct ArchiveExtractorApp {
     is_encrypted: bool,
     password: String,
     password_error: bool,
+    show_password: bool,
 }
 
 impl Default for ArchiveExtractorApp {
@@ -51,6 +52,7 @@ impl Default for ArchiveExtractorApp {
             is_encrypted: false,
             password: String::new(),
             password_error: false,
+            show_password: false,
         }
     }
 }
@@ -305,46 +307,101 @@ impl ArchiveExtractorApp {
 
             ui.add_space(12.0);
 
-            // Password field (only for encrypted archives)
+            // Password section (only for encrypted archives)
             if self.is_encrypted && !self.is_extracting && self.extraction_progress < 100.0 {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Password:").size(12.0).color(
-                        if self.password_error {
-                            egui::Color32::from_rgb(220, 80, 80)
+                let bg = if self.password_error {
+                    egui::Color32::from_rgba_premultiplied(80, 30, 30, 60)
+                } else {
+                    egui::Color32::from_rgba_premultiplied(70, 60, 20, 50)
+                };
+                let frame = egui::Frame::none()
+                    .fill(bg)
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("🔒").size(16.0));
+                        let pass_label = if self.password_error {
+                            "Password required (incorrect)"
                         } else {
-                            egui::Color32::GRAY
-                        },
-                    ));
+                            "This archive is password protected"
+                        };
+                        let pass_color = if self.password_error {
+                            egui::Color32::from_rgb(240, 120, 120)
+                        } else {
+                            egui::Color32::from_rgb(220, 190, 80)
+                        };
+                        ui.label(
+                            egui::RichText::new(pass_label)
+                                .size(13.0)
+                                .color(pass_color),
+                        );
+                    });
 
-                    let password_edit = egui::TextEdit::singleline(&mut self.password)
-                        .password(true)
-                        .desired_width(200.0)
-                        .hint_text("Enter archive password");
+                    ui.add_space(6.0);
 
-                    ui.add(password_edit);
+                    ui.horizontal(|ui| {
+                        let mut password_edit =
+                            egui::TextEdit::singleline(&mut self.password)
+                                .password(!self.show_password)
+                                .desired_width(280.0)
+                                .hint_text("Enter archive password");
 
-                    if ui.button("Show").clicked() {
-                        // Toggle password visibility would require additional state
-                        // For now, just a simple reveal
-                    }
+                        if self.password_error {
+                            password_edit = password_edit
+                                .text_color_opt(Some(egui::Color32::from_rgb(255, 160, 160)));
+                        }
+
+                        ui.add(password_edit);
+
+                        let toggle_label = if self.show_password { "🙈" } else { "👁️" };
+                        let toggle_tip = if self.show_password { "Hide password" } else { "Show password" };
+                        if ui.add(
+                            egui::Button::new(toggle_label)
+                                .min_size(egui::vec2(32.0, 24.0))
+                                .rounding(egui::Rounding::same(4.0)),
+                        )
+                        .on_hover_text(toggle_tip)
+                        .clicked()
+                        {
+                            self.show_password = !self.show_password;
+                        }
+                    });
                 });
-                ui.add_space(8.0);
+                ui.add_space(10.0);
             }
 
             // Progress bar (during extraction)
             if self.is_extracting || self.extraction_progress > 0.0 {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::ProgressBar::new(self.extraction_progress / 100.0)
-                            .show_percentage()
-                            .text(&self.extraction_status),
-                    );
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_premultiplied(40, 50, 60, 40))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                ui.available_size() - egui::vec2(if self.is_extracting { 90.0 } else { 0.0 }, 0.0),
+                                egui::ProgressBar::new(self.extraction_progress / 100.0)
+                                    .desired_width(ui.available_size().x)
+                                    .show_percentage()
+                                    .text(&self.extraction_status)
+                                    .rounding(egui::Rounding::same(4.0)),
+                            );
 
-                    if self.is_extracting && ui.button("Cancel").clicked() {
-                        self.cancel_flag.store(true, Ordering::Relaxed);
-                    }
-                });
-                ui.add_space(8.0);
+                            if self.is_extracting
+                                && ui.add(
+                                    egui::Button::new("✕ Cancel")
+                                        .min_size(egui::vec2(80.0, 24.0))
+                                        .rounding(egui::Rounding::same(4.0)),
+                                )
+                                .on_hover_text("Esc")
+                                .clicked()
+                            {
+                                self.cancel_flag.store(true, Ordering::Relaxed);
+                            }
+                        });
+                    });
+                ui.add_space(10.0);
             }
 
             ui.add_space(8.0);
@@ -352,7 +409,14 @@ impl ArchiveExtractorApp {
             // Action buttons
             ui.horizontal(|ui| {
                 if self.archive_path.is_none() {
-                    if ui.button("Open Archive").clicked() {
+                    if ui.add(
+                        egui::Button::new("📂 Open Archive")
+                            .min_size(egui::vec2(130.0, 32.0))
+                            .rounding(egui::Rounding::same(6.0)),
+                    )
+                    .on_hover_text("Ctrl+O")
+                    .clicked()
+                    {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Archive", formats::supported_extensions())
                             .pick_file()
@@ -361,7 +425,14 @@ impl ArchiveExtractorApp {
                         }
                     }
                 } else if !self.is_extracting && self.extraction_progress < 100.0 {
-                    if ui.button("Change Archive").clicked() {
+                    if ui.add(
+                        egui::Button::new("📂 Change Archive")
+                            .min_size(egui::vec2(130.0, 32.0))
+                            .rounding(egui::Rounding::same(6.0)),
+                    )
+                    .on_hover_text("Ctrl+O")
+                    .clicked()
+                    {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Archive", formats::supported_extensions())
                             .pick_file()
@@ -370,15 +441,62 @@ impl ArchiveExtractorApp {
                         }
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
 
-                    let btn = egui::Button::new("Extract").min_size(egui::vec2(80.0, 28.0));
-
-                    if ui.add(btn).clicked() {
-                        self.start_extraction();
+                    if ui.add(
+                        egui::Button::new("📁 Destination")
+                            .min_size(egui::vec2(110.0, 32.0))
+                            .rounding(egui::Rounding::same(6.0)),
+                    )
+                    .on_hover_text("Ctrl+D")
+                    .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.destination_path = Some(path.clone());
+                            self.destination_edit = path.display().to_string();
+                        }
                     }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let needs_password = self.is_encrypted && self.password.is_empty();
+                        let extract_label = if needs_password {
+                            "🔒 Extract"
+                        } else {
+                            "▶ Extract"
+                        };
+                        let btn = egui::Button::new(
+                            egui::RichText::new(extract_label)
+                                .size(14.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .min_size(egui::vec2(110.0, 36.0))
+                        .rounding(egui::Rounding::same(6.0))
+                        .fill(if needs_password {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        } else {
+                            egui::Color32::from_rgb(60, 140, 80)
+                        });
+
+                        if ui.add(btn)
+                            .on_hover_text(if needs_password {
+                                "Enter password first"
+                            } else {
+                                "Ctrl+E"
+                            })
+                            .clicked()
+                            && !needs_password
+                        {
+                            self.start_extraction();
+                        }
+                    });
                 } else if self.extraction_progress >= 100.0 {
-                    if ui.button("Open Another Archive").clicked() {
+                    if ui.add(
+                        egui::Button::new("📂 Open Another")
+                            .min_size(egui::vec2(130.0, 32.0))
+                            .rounding(egui::Rounding::same(6.0)),
+                    )
+                    .clicked()
+                    {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Archive", formats::supported_extensions())
                             .pick_file()
@@ -387,10 +505,16 @@ impl ArchiveExtractorApp {
                         }
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
 
                     if let Some(ref dest) = self.destination_path {
-                        if ui.button("Open Destination").clicked() {
+                        if ui.add(
+                            egui::Button::new("📂 Open Destination")
+                                .min_size(egui::vec2(140.0, 32.0))
+                                .rounding(egui::Rounding::same(6.0)),
+                        )
+                        .clicked()
+                        {
                             let _ = open::that(dest);
                         }
                     }
@@ -399,96 +523,182 @@ impl ArchiveExtractorApp {
 
             ui.add_space(16.0);
 
-            // File list
+            // File list header
             if !self.archive_entries.is_empty() {
                 ui.horizontal(|ui| {
+                    let total = self.archive_entries.len();
+                    let showing = if self.search_query.is_empty() {
+                        format!("Contents  ·  {} files", total)
+                    } else {
+                        let count = self.filtered_entries_owned().len();
+                        format!("Contents  ·  {} / {} files", count, total)
+                    };
                     ui.label(
-                        egui::RichText::new("Contents")
-                            .size(14.0)
-                            .color(egui::Color32::WHITE),
+                        egui::RichText::new(showing)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(180, 180, 190)),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let search = egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("Search")
-                            .desired_width(180.0);
-                        ui.add(search);
+                        let _search_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("🔍 Search files...")
+                                .desired_width(200.0),
+                        );
+
+                        if !self.search_query.is_empty()
+                            && ui.add(
+                                egui::Button::new("✕")
+                                    .min_size(egui::vec2(20.0, 20.0))
+                                    .rounding(egui::Rounding::same(4.0)),
+                            )
+                            .clicked()
+                        {
+                            self.search_query.clear();
+                        }
                     });
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let filtered = self.filtered_entries_owned();
-                    for entry in filtered.iter() {
-                        let icon = formats::file_icon(entry);
-                        let size = formats::format_size(entry.size);
+                // File list
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let filtered = self.filtered_entries_owned();
 
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(icon).size(16.0));
-                            ui.label(
-                                egui::RichText::new(&entry.name)
-                                    .size(13.0)
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(size)
-                                            .size(11.0)
-                                            .color(egui::Color32::from_rgb(120, 120, 120)),
-                                    );
-                                },
-                            );
-                        });
-                    }
-                });
+                        if filtered.is_empty() {
+                            ui.add_space(20.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("🔍 No files match your search")
+                                        .size(13.0)
+                                        .color(egui::Color32::from_rgb(140, 140, 150)),
+                                );
+                            });
+                            ui.add_space(10.0);
+                        } else {
+                            for (idx, entry) in filtered.iter().enumerate() {
+                                let bg = if idx % 2 == 0 {
+                                    egui::Color32::from_rgba_premultiplied(30, 30, 38, 80)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+
+                                egui::Frame::none()
+                                    .fill(bg)
+                                    .rounding(egui::Rounding::same(4.0))
+                                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(formats::file_icon(entry))
+                                                    .size(14.0),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&entry.name)
+                                                    .size(13.0)
+                                                    .color(if entry.is_dir {
+                                                        egui::Color32::from_rgb(160, 180, 210)
+                                                    } else {
+                                                        egui::Color32::WHITE
+                                                    }),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(
+                                                    egui::Align::Center,
+                                                ),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(formats::format_size(
+                                                            entry.size,
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(egui::Color32::from_rgb(
+                                                            120, 120, 130,
+                                                        )),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    });
+                            }
+                        }
+                    });
             }
         });
     }
 
     fn ui_drop_zone(&mut self, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| {
-            ui.vertical(|ui| {
-                ui.add_space(50.0);
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgba_premultiplied(35, 35, 45, 50))
+                .rounding(egui::Rounding::same(16.0))
+                .inner_margin(egui::Margin::symmetric(40.0, 30.0))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(20.0);
 
-                ui.label(
-                    egui::RichText::new("Drop archive here")
-                        .size(24.0)
-                        .color(egui::Color32::WHITE),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("Drop archive here")
-                        .size(20.0)
-                        .color(egui::Color32::WHITE),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("or click to browse")
-                        .size(14.0)
-                        .color(egui::Color32::GRAY),
-                );
-                ui.add_space(20.0);
+                        // Large archive icon
+                        ui.label(
+                            egui::RichText::new("📦")
+                                .size(48.0)
+                                .color(egui::Color32::from_rgb(150, 180, 220)),
+                        );
 
-                if ui.button("📂 Browse Files").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Archive", formats::supported_extensions())
-                        .pick_file()
-                    {
-                        self.set_archive(path);
-                    }
-                }
+                        ui.add_space(12.0);
 
-                ui.add_space(20.0);
+                        ui.label(
+                            egui::RichText::new("Drop an archive file here")
+                                .size(20.0)
+                                .color(egui::Color32::WHITE),
+                        );
 
-                ui.label(
-                    egui::RichText::new("Supported: ZIP, TAR, GZ, BZ2, XZ, RAR")
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(100, 100, 100)),
-                );
-            });
+                        ui.add_space(4.0);
+
+                        ui.label(
+                            egui::RichText::new("or click to browse")
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(140, 140, 150)),
+                        );
+
+                        ui.add_space(16.0);
+
+                        if ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("📂 Browse Files")
+                                    .size(14.0)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .min_size(egui::vec2(140.0, 36.0))
+                            .rounding(egui::Rounding::same(8.0))
+                            .fill(egui::Color32::from_rgb(60, 100, 160)),
+                        )
+                        .on_hover_text("Ctrl+O")
+                        .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Archive", formats::supported_extensions())
+                                .pick_file()
+                            {
+                                self.set_archive(path);
+                            }
+                        }
+
+                        ui.add_space(16.0);
+
+                        ui.label(
+                            egui::RichText::new(
+                                "Supported: ZIP, TAR, GZ, BZ2, XZ, RAR, 7z, ZST, BR, LZ4",
+                            )
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(100, 100, 110)),
+                        );
+
+                        ui.add_space(10.0);
+                    });
+                });
         });
     }
 
