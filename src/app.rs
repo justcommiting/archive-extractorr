@@ -29,6 +29,7 @@ pub struct ArchiveExtractorApp {
     password: String,
     password_error: bool,
     show_password: bool,
+    request_password_focus: bool, // <-- ADDED
     error_message: Arc<Mutex<Option<String>>>,
 }
 
@@ -54,6 +55,7 @@ impl Default for ArchiveExtractorApp {
             password: String::new(),
             password_error: false,
             show_password: false,
+            request_password_focus: false, // <-- ADDED
             error_message: Arc::new(Mutex::new(None)),
         }
     }
@@ -74,6 +76,7 @@ impl ArchiveExtractorApp {
         self.password.clear();
         self.password_error = false;
         self.is_encrypted = false;
+        self.request_password_focus = false; // <-- ADDED: Reset focus flag
 
         match self.archive_format {
             Some(format) => {
@@ -85,20 +88,21 @@ impl ArchiveExtractorApp {
                 };
 
                 self.status_message = format!(
-                    "Loaded {} · {}",
+                    "Loaded {} · {} ",
                     path.file_name().unwrap_or_default().to_string_lossy(),
                     formats::format_name(format)
                 );
 
                 if self.is_encrypted {
                     self.status_message.push_str(" (password protected)");
+                    self.request_password_focus = true; // <-- ADDED: Auto-focus on load
                 }
 
                 match extractor::list_archive(&path) {
                     Ok(entries) => {
                         self.archive_entries = entries;
                         self.status_message = format!(
-                            "{} files · {}",
+                            "{} files · {} ",
                             self.archive_entries.len(),
                             formats::format_size(self.total_size())
                         );
@@ -150,6 +154,7 @@ impl ArchiveExtractorApp {
         let password = if self.is_encrypted && !self.password.is_empty() {
             Some(self.password.clone())
         } else if self.is_encrypted {
+            self.password_error = true; // <-- ADDED: Show error if empty
             return; // Need password
         } else {
             None
@@ -201,7 +206,7 @@ impl ArchiveExtractorApp {
 
         if total > 0 {
             self.extraction_progress = (current as f32 / total as f32) * 100.0;
-            self.extraction_status = format!("{} / {} files", current, total);
+            self.extraction_status = format!("{} / {} files ", current, total);
         }
 
         if let Some(handle) = &self.extraction_handle {
@@ -287,12 +292,12 @@ impl ArchiveExtractorApp {
                         );
                         if let Some(fmt) = self.archive_format {
                             let mut info_text = format!(
-                                "{} {}",
+                                "{} {} ",
                                 formats::format_icon(fmt),
                                 formats::format_name(fmt)
                             );
                             if self.is_encrypted {
-                                info_text.push_str(" 🔒");
+                                info_text.push_str(" 🔒 ");
                             }
                             ui.label(
                                 egui::RichText::new(info_text)
@@ -358,7 +363,7 @@ impl ArchiveExtractorApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 10.0));
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🔒").size(16.0));
+                        ui.label(egui::RichText::new("🔒 ").size(16.0));
                         let pass_label = if self.password_error {
                             "Password required (incorrect)"
                         } else {
@@ -379,21 +384,44 @@ impl ArchiveExtractorApp {
                     ui.add_space(6.0);
 
                     ui.horizontal(|ui| {
-                        let mut password_edit =
-                            egui::TextEdit::singleline(&mut self.password)
-                                .password(!self.show_password)
-                                .desired_width(280.0)
-                                .hint_text("Enter archive password");
+                        // Generate a persistent ID for the text field so we can request focus
+                        let password_id = ui.make_persistent_id("password_input");
+
+                        // Auto-focus the password field when a new encrypted archive is loaded
+                        if self.request_password_focus {
+                            ui.memory_mut(|mem| mem.request_focus(password_id));
+                            self.request_password_focus = false;
+                        }
+
+                        let mut password_edit = egui::TextEdit::singleline(&mut self.password)
+                            .id(password_id)
+                            .password(!self.show_password)
+                            .desired_width(ui.available_width() - 50.0) // <-- IMPROVED: Responsive width
+                            .hint_text("Enter archive password");
 
                         if self.password_error {
                             password_edit = password_edit
                                 .text_color_opt(Some(egui::Color32::from_rgb(255, 160, 160)));
                         }
 
-                        ui.add(password_edit);
+                        let response = ui.add(password_edit);
+
+                        // Clear error state immediately when the user starts typing a new password
+                        if response.changed() {
+                            self.password_error = false;
+                        }
+
+                        // Allow pressing Enter to trigger extraction
+                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.start_extraction();
+                        }
 
                         let toggle_label = if self.show_password { "🙈" } else { "👁️" };
-                        let toggle_tip = if self.show_password { "Hide password" } else { "Show password" };
+                        let toggle_tip = if self.show_password {
+                            "Hide password"
+                        } else {
+                            "Show password"
+                        };
                         if ui.add(
                             egui::Button::new(toggle_label)
                                 .min_size(egui::vec2(32.0, 24.0))
@@ -418,7 +446,8 @@ impl ArchiveExtractorApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.add_sized(
-                                ui.available_size() - egui::vec2(if self.is_extracting { 90.0 } else { 0.0 }, 0.0),
+                                ui.available_size()
+                                    - egui::vec2(if self.is_extracting { 90.0 } else { 0.0 }, 0.0),
                                 egui::ProgressBar::new(self.extraction_progress / 100.0)
                                     .desired_width(ui.available_size().x)
                                     .show_percentage()
@@ -566,10 +595,10 @@ impl ArchiveExtractorApp {
                 ui.horizontal(|ui| {
                     let total = self.archive_entries.len();
                     let showing = if self.search_query.is_empty() {
-                        format!("Contents  ·  {} files", total)
+                        format!("Contents  ·  {} files ", total)
                     } else {
                         let count = self.filtered_entries_owned().len();
-                        format!("Contents  ·  {} / {} files", count, total)
+                        format!("Contents  ·  {} / {} files ", count, total)
                     };
                     ui.label(
                         egui::RichText::new(showing)
@@ -644,9 +673,7 @@ impl ArchiveExtractorApp {
                                                     }),
                                             );
                                             ui.with_layout(
-                                                egui::Layout::right_to_left(
-                                                    egui::Align::Center,
-                                                ),
+                                                egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
                                                     ui.label(
                                                         egui::RichText::new(formats::format_size(
@@ -754,7 +781,6 @@ impl ArchiveExtractorApp {
 impl eframe::App for ArchiveExtractorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_extraction_status();
-
         if self.is_extracting {
             ctx.request_repaint();
         }
