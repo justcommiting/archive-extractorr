@@ -47,11 +47,15 @@ pub fn is_zip_encrypted(path: &Path) -> bool {
 pub fn is_rar_encrypted(path: &Path) -> bool {
     let path_str = path.to_string_lossy().to_string();
     if let Ok(mut archive) = RarArchive::new(&path_str).open_for_listing() {
-        // If we can list entries without a password, it's not encrypted
-        for entry in archive.by_ref().filter_map(|e| e.ok()) {
-            // Check if entry has encryption flags
-            if entry.is_encrypted() {
-                return true;
+        for entry in archive.by_ref() {
+            match entry {
+                Ok(entry) => {
+                    if entry.is_encrypted() {
+                        return true;
+                    }
+                }
+                // Listing failures on protected archives are frequently surfaced here.
+                Err(_) => return true,
             }
         }
         false
@@ -60,6 +64,34 @@ pub fn is_rar_encrypted(path: &Path) -> bool {
         // when listing an encrypted archive without password)
         true
     }
+}
+
+/// Check if a 7z archive is password protected
+pub fn is_sevenzip_encrypted(path: &Path) -> bool {
+    let temp_dir = std::env::temp_dir().join("archive-extractor-7z-encrypted-check");
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let result = sevenz_rust::decompress_file_with_extract_fn(
+        path,
+        &temp_dir,
+        &mut |_entry: &SevenZArchiveEntry,
+              reader: &mut dyn Read,
+              _dest: &PathBuf|
+              -> Result<bool, sevenz_rust::Error> {
+            // Touch the stream so missing-password failures surface as explicit errors.
+            let mut buf = [0u8; 1];
+            let _ = reader.read(&mut buf).map_err(sevenz_rust::Error::io)?;
+            Ok(false)
+        },
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    matches!(
+        result,
+        Err(sevenz_rust::Error::PasswordRequired)
+            | Err(sevenz_rust::Error::MaybeBadPassword(_))
+    )
 }
 
 /// Supported archive formats
@@ -693,7 +725,7 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
             let _ = fs::remove_dir_all(&temp_dir);
             let mut entries = Vec::new();
             let path_clone = path.to_path_buf();
-            let _ = sevenz_rust::decompress_file_with_extract_fn(
+            let list_result = sevenz_rust::decompress_file_with_extract_fn(
                 &path_clone,
                 &temp_dir,
                 &mut |entry: &SevenZArchiveEntry, reader: &mut dyn Read, _dest: &PathBuf| -> Result<bool, sevenz_rust::Error> {
@@ -705,13 +737,24 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
                         compressed_size: 0,
                         path: std::path::Path::new(&name).to_path_buf(),
                     });
-                    // Skip actual extraction by draining the reader
+                    // Skip actual extraction while still surfacing read/decrypt errors.
                     let mut buf = [0u8; 8192];
-                    while reader.read(&mut buf).unwrap_or(0) > 0 {}
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) => return Err(sevenz_rust::Error::io(e)),
+                        }
+                    }
                     Ok(false)
                 },
             );
             let _ = fs::remove_dir_all(&temp_dir);
+
+            if let Err(e) = list_result {
+                return Err(anyhow::anyhow!("Failed to list 7z archive: {}", e));
+            }
+
             if entries.is_empty() {
                 Ok(vec![ArchiveEntry {
                     name: path

@@ -84,6 +84,7 @@ impl ArchiveExtractorApp {
                 self.is_encrypted = match format {
                     ArchiveFormat::Zip => extractor::is_zip_encrypted(&path),
                     ArchiveFormat::Rar => extractor::is_rar_encrypted(&path),
+                    ArchiveFormat::SevenZip => extractor::is_sevenzip_encrypted(&path),
                     _ => false,
                 };
 
@@ -109,7 +110,20 @@ impl ArchiveExtractorApp {
                     }
                     Err(e) => {
                         error!("Failed to list archive entries: {}", e);
-                        self.status_message = format!("Error: {}", e);
+                        let err_text = e.to_string();
+                        let err_lower = err_text.to_lowercase();
+                        let is_password_err = err_lower.contains("password")
+                            || err_lower.contains("decrypt")
+                            || err_lower.contains("badpassword")
+                            || err_lower.contains("passwordrequired");
+
+                        if is_password_err {
+                            self.is_encrypted = true;
+                            self.request_password_focus = true;
+                            self.status_message = String::from("Archive is password protected");
+                        } else {
+                            self.status_message = format!("Error: {}", err_text);
+                        }
                     }
                 }
             }
