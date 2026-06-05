@@ -4,7 +4,7 @@ use flate2::read::GzDecoder;
 use lz4_flex::frame::FrameDecoder as Lz4Decoder;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tar::Archive;
@@ -12,6 +12,43 @@ use unrar::Archive as RarArchive;
 use xz2::read::XzDecoder;
 use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
+
+/// Helper to sanitize and validate target paths to prevent directory traversal
+fn sanitize_target_path(dest: &Path, entry_path: &Path) -> Result<PathBuf> {
+    let mut safe_path = PathBuf::new();
+    for component in entry_path.components() {
+        match component {
+            std::path::Component::Normal(c) => safe_path.push(c),
+            std::path::Component::ParentDir => {
+                anyhow::bail!("Directory traversal attempt detected: {:?}", entry_path);
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                // Skip absolute prefixes to enforce relativity to dest
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+    let full_path = dest.join(safe_path);
+    if full_path.starts_with(dest) {
+        Ok(full_path)
+    } else {
+        anyhow::bail!("Path escapes destination directory: {:?}", entry_path);
+    }
+}
+
+/// Standard Read wrapper that updates progress with the number of bytes read
+struct ProgressReader<R> {
+    inner: R,
+    progress: Arc<AtomicUsize>,
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let bytes = self.inner.read(buf)?;
+        self.progress.fetch_add(bytes, Ordering::Relaxed);
+        Ok(bytes)
+    }
+}
 
 /// Archive entry information
 #[derive(Clone, Debug)]
@@ -29,10 +66,9 @@ pub fn is_zip_encrypted(path: &Path) -> bool {
     if let Ok(file) = File::open(path) {
         if let Ok(mut archive) = ZipArchive::new(file) {
             for i in 0..archive.len() {
-                // Try to get the file - if it fails with UnsupportedArchive, it's encrypted
                 match archive.by_index(i) {
                     Ok(_) => continue,
-                    Err(zip::result::ZipError::UnsupportedArchive(_)) => return true,
+                    Err(zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED)) => return true,
                     Err(_) => continue,
                 }
             }
@@ -243,8 +279,8 @@ pub fn extract_zip(
 
         let entry_path = entry
             .enclosed_name()
-            .unwrap_or_else(|| Path::new(entry.name()));
-        let out_path = dest.join(entry_path);
+            .ok_or_else(|| anyhow::anyhow!("Entry path escapes archive directory: {}", entry.name()))?;
+        let out_path = sanitize_target_path(dest, entry_path)?;
 
         if entry.name().ends_with('/') {
             let mut created_dirs_lock = created_dirs.lock().unwrap();
@@ -307,7 +343,7 @@ pub fn extract_tar(
 pub fn extract_gzip(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
@@ -317,7 +353,14 @@ pub fn extract_gzip(
     }
 
     let file = File::open(path).context("Failed to open GZIP file")?;
-    let mut decoder = GzDecoder::new(file);
+    let metadata = file.metadata().context("Failed to read GZIP file metadata")?;
+    total.store(metadata.len() as usize, Ordering::Relaxed);
+
+    let progress_reader = ProgressReader {
+        inner: file,
+        progress: Arc::clone(&progress),
+    };
+    let mut decoder = GzDecoder::new(progress_reader);
 
     let mut output_name = path
         .file_name()
@@ -338,8 +381,6 @@ pub fn extract_gzip(
         .context("Failed to decompress and write output")?;
     outfile.flush().context("Failed to flush output")?;
 
-    total.store(1, Ordering::Relaxed);
-
     Ok(1)
 }
 
@@ -347,7 +388,7 @@ pub fn extract_gzip(
 pub fn extract_bzip2(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
@@ -357,7 +398,14 @@ pub fn extract_bzip2(
     }
 
     let file = File::open(path).context("Failed to open BZIP2 file")?;
-    let mut decoder = bzip2::read::BzDecoder::new(file);
+    let metadata = file.metadata().context("Failed to read BZIP2 file metadata")?;
+    total.store(metadata.len() as usize, Ordering::Relaxed);
+
+    let progress_reader = ProgressReader {
+        inner: file,
+        progress: Arc::clone(&progress),
+    };
+    let mut decoder = bzip2::read::BzDecoder::new(progress_reader);
 
     let mut output_name = path
         .file_name()
@@ -378,8 +426,6 @@ pub fn extract_bzip2(
         .context("Failed to decompress and write output")?;
     outfile.flush().context("Failed to flush output")?;
 
-    total.store(1, Ordering::Relaxed);
-
     Ok(1)
 }
 
@@ -387,7 +433,7 @@ pub fn extract_bzip2(
 pub fn extract_xz(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
@@ -397,7 +443,14 @@ pub fn extract_xz(
     }
 
     let file = File::open(path).context("Failed to open XZ file")?;
-    let mut decoder = XzDecoder::new(file);
+    let metadata = file.metadata().context("Failed to read XZ file metadata")?;
+    total.store(metadata.len() as usize, Ordering::Relaxed);
+
+    let progress_reader = ProgressReader {
+        inner: file,
+        progress: Arc::clone(&progress),
+    };
+    let mut decoder = XzDecoder::new(progress_reader);
 
     let mut output_name = path
         .file_name()
@@ -417,8 +470,6 @@ pub fn extract_xz(
     io::copy(&mut decoder, &mut outfile)
         .context("Failed to decompress and write output")?;
     outfile.flush().context("Failed to flush output")?;
-
-    total.store(1, Ordering::Relaxed);
 
     Ok(1)
 }
@@ -455,7 +506,9 @@ pub fn extract_sevenzip(
             return Err(sevenz_rust::Error::other("Extraction cancelled"));
         }
 
-        let out_path = dest.join(&entry.name);
+        let entry_path = Path::new(&entry.name);
+        let out_path = sanitize_target_path(dest, entry_path)
+            .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
 
         if entry.is_directory() {
             if !created_dirs.contains(&out_path) {
@@ -497,7 +550,7 @@ pub fn extract_sevenzip(
 pub fn extract_zstd(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
@@ -507,7 +560,14 @@ pub fn extract_zstd(
     }
 
     let file = File::open(path).context("Failed to open Zstandard file")?;
-    let mut decoder = ZstdDecoder::new(file).context("Failed to create Zstandard decoder")?;
+    let metadata = file.metadata().context("Failed to read Zstandard file metadata")?;
+    total.store(metadata.len() as usize, Ordering::Relaxed);
+
+    let progress_reader = ProgressReader {
+        inner: file,
+        progress: Arc::clone(&progress),
+    };
+    let mut decoder = ZstdDecoder::new(progress_reader).context("Failed to create Zstandard decoder")?;
 
     let mut output_name = path
         .file_name()
@@ -532,8 +592,6 @@ pub fn extract_zstd(
         .context("Failed to decompress and write output")?;
     outfile.flush().context("Failed to flush output")?;
 
-    total.store(1, Ordering::Relaxed);
-
     Ok(1)
 }
 
@@ -541,7 +599,7 @@ pub fn extract_zstd(
 pub fn extract_brotli(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
@@ -551,7 +609,14 @@ pub fn extract_brotli(
     }
 
     let file = File::open(path).context("Failed to open Brotli file")?;
-    let mut decoder = BrotliDecoder::new(file, 4096);
+    let metadata = file.metadata().context("Failed to read Brotli file metadata")?;
+    total.store(metadata.len() as usize, Ordering::Relaxed);
+
+    let progress_reader = ProgressReader {
+        inner: file,
+        progress: Arc::clone(&progress),
+    };
+    let mut decoder = BrotliDecoder::new(progress_reader, 4096);
 
     let mut output_name = path
         .file_name()
@@ -574,8 +639,6 @@ pub fn extract_brotli(
         .context("Failed to decompress and write output")?;
     outfile.flush().context("Failed to flush output")?;
 
-    total.store(1, Ordering::Relaxed);
-
     Ok(1)
 }
 
@@ -583,7 +646,7 @@ pub fn extract_brotli(
 pub fn extract_lz4(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
     _password: Option<&str>,
@@ -593,7 +656,14 @@ pub fn extract_lz4(
     }
 
     let file = File::open(path).context("Failed to open LZ4 file")?;
-    let mut decoder = Lz4Decoder::new(file);
+    let metadata = file.metadata().context("Failed to read LZ4 file metadata")?;
+    total.store(metadata.len() as usize, Ordering::Relaxed);
+
+    let progress_reader = ProgressReader {
+        inner: file,
+        progress: Arc::clone(&progress),
+    };
+    let mut decoder = Lz4Decoder::new(progress_reader);
 
     let mut output_name = path
         .file_name()
@@ -615,8 +685,6 @@ pub fn extract_lz4(
     io::copy(&mut decoder, &mut outfile)
         .context("Failed to decompress and write output")?;
     outfile.flush().context("Failed to flush output")?;
-
-    total.store(1, Ordering::Relaxed);
 
     Ok(1)
 }
@@ -668,7 +736,7 @@ pub fn extract_rar(
 
         let header = archive_with_header.entry();
         let entry_path = header.filename.clone();
-        let out_path = dest.join(&entry_path);
+        let out_path = sanitize_target_path(dest, &entry_path)?;
 
         if let Some(parent) = out_path.parent() {
             if !created_dirs.contains(parent) {
@@ -942,6 +1010,37 @@ mod tests {
     fn test_archive_format_from_magic_bytes_unknown() {
         let data = vec![0x00, 0x01, 0x02, 0x03];
         assert_eq!(ArchiveFormat::from_magic_bytes(&data), None);
+    }
+
+    #[test]
+    fn test_sanitize_target_path() {
+        let dest = Path::new("/target/dir");
+        
+        // Safe relative paths
+        assert_eq!(
+            sanitize_target_path(dest, Path::new("file.txt")).unwrap(),
+            dest.join("file.txt")
+        );
+        assert_eq!(
+            sanitize_target_path(dest, Path::new("sub/dir/file.txt")).unwrap(),
+            dest.join("sub/dir/file.txt")
+        );
+
+        // Path containing CurDir components
+        assert_eq!(
+            sanitize_target_path(dest, Path::new("./file.txt")).unwrap(),
+            dest.join("file.txt")
+        );
+
+        // Absolute paths should be converted to relative to dest
+        assert_eq!(
+            sanitize_target_path(dest, Path::new("/file.txt")).unwrap(),
+            dest.join("file.txt")
+        );
+
+        // Directory traversal using ParentDir components should fail
+        assert!(sanitize_target_path(dest, Path::new("../file.txt")).is_err());
+        assert!(sanitize_target_path(dest, Path::new("sub/../../file.txt")).is_err());
     }
 
     #[test]

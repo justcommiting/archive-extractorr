@@ -1,4 +1,5 @@
 use crate::extractor::{self, ArchiveFormat};
+use crate::formats::{format_name, format_size};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -222,33 +223,3 @@ fn run_info(archive: &Path, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn format_name(format: ArchiveFormat) -> &'static str {
-    match format {
-        ArchiveFormat::Zip => "ZIP",
-        ArchiveFormat::Tar => "TAR",
-        ArchiveFormat::Gzip => "GZIP",
-        ArchiveFormat::Bzip2 => "BZIP2",
-        ArchiveFormat::Xz => "XZ",
-        ArchiveFormat::SevenZip => "7z",
-        ArchiveFormat::Zstd => "ZSTD",
-        ArchiveFormat::Brotli => "BROTLI",
-        ArchiveFormat::Lz4 => "LZ4",
-        ArchiveFormat::Rar => "RAR",
-        ArchiveFormat::Unknown => "Unknown",
-    }
-}
-
-fn format_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    const TB: u64 = 1024 * GB;
-
-    match size {
-        s if s < KB => format!("{} B", s),
-        s if s < MB => format!("{:.1} KB", s as f64 / KB as f64),
-        s if s < GB => format!("{:.1} MB", s as f64 / MB as f64),
-        s if s < TB => format!("{:.1} GB", s as f64 / GB as f64),
-        s => format!("{:.1} TB", s as f64 / TB as f64),
-    }
-}

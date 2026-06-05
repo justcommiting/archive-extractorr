@@ -44,6 +44,7 @@ pub struct ArchiveExtractorApp {
     show_password: bool,
     request_password_focus: bool, // <-- ADDED
     error_message: Arc<Mutex<Option<String>>>,
+    filtered_entries: Vec<ArchiveEntry>,
     
     // Sorting state
     sort_by: SortBy,
@@ -77,8 +78,9 @@ impl Default for ArchiveExtractorApp {
             password: String::new(),
             password_error: false,
             show_password: false,
-            request_password_focus: false, // <-- ADDED
+            request_password_focus: false,
             error_message: Arc::new(Mutex::new(None)),
+            filtered_entries: Vec::new(),
             sort_by: SortBy::Name,
             sort_ascending: true,
             extraction_start_time: None,
@@ -99,6 +101,7 @@ impl ArchiveExtractorApp {
         self.archive_path = Some(path.clone());
         self.archive_format = ArchiveFormat::detect(&path);
         self.archive_entries.clear();
+        self.filtered_entries.clear();
         self.extraction_progress = 0.0;
         self.password.clear();
         self.password_error = false;
@@ -129,6 +132,7 @@ impl ArchiveExtractorApp {
                 match extractor::list_archive(&path) {
                     Ok(entries) => {
                         self.archive_entries = entries;
+                        self.update_filtered_entries();
                         self.status_message = format!(
                             "{} files · {} ",
                             self.archive_entries.len(),
@@ -182,14 +186,15 @@ impl ArchiveExtractorApp {
         self.archive_entries.iter().map(|e| e.size).sum()
     }
 
-    fn filtered_entries_owned(&self) -> Vec<&ArchiveEntry> {
-        let mut entries: Vec<&ArchiveEntry> = if self.search_query.is_empty() {
-            self.archive_entries.iter().collect()
+    fn update_filtered_entries(&mut self) {
+        let mut entries: Vec<ArchiveEntry> = if self.search_query.is_empty() {
+            self.archive_entries.clone()
         } else {
             let search_lower = self.search_query.to_lowercase();
             self.archive_entries
                 .iter()
                 .filter(|e| e.name.to_lowercase().contains(&search_lower))
+                .cloned()
                 .collect()
         };
 
@@ -216,7 +221,7 @@ impl ArchiveExtractorApp {
             }
         });
 
-        entries
+        self.filtered_entries = entries;
     }
 
     fn start_extraction(&mut self) {
@@ -284,7 +289,15 @@ impl ArchiveExtractorApp {
 
         if total > 0 {
             self.extraction_progress = (current as f32 / total as f32) * 100.0;
-            self.extraction_status = format!("{} / {} files ", current, total);
+            if self.archive_format.map_or(false, |f| f.is_single_file()) {
+                self.extraction_status = format!(
+                    "{} / {}",
+                    formats::format_size(current as u64),
+                    formats::format_size(total as u64)
+                );
+            } else {
+                self.extraction_status = format!("{} / {} files ", current, total);
+            }
         }
 
         if let Some(start_time) = self.extraction_start_time {
@@ -708,7 +721,7 @@ impl ArchiveExtractorApp {
                     let showing = if self.search_query.is_empty() {
                         format!("Contents  ·  {} files ", total)
                     } else {
-                        let count = self.filtered_entries_owned().len();
+                        let count = self.filtered_entries.len();
                         format!("Contents  ·  {} / {} files ", count, total)
                     };
                     ui.label(
@@ -718,11 +731,14 @@ impl ArchiveExtractorApp {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let _search_resp = ui.add(
+                        let search_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text("Search files...")
                                 .desired_width(200.0),
                         );
+                        if search_resp.changed() {
+                            self.update_filtered_entries();
+                        }
 
                         if !self.search_query.is_empty()
                             && ui.add(
@@ -733,6 +749,7 @@ impl ArchiveExtractorApp {
                             .clicked()
                         {
                             self.search_query.clear();
+                            self.update_filtered_entries();
                         }
                     });
                 });
@@ -765,6 +782,7 @@ impl ArchiveExtractorApp {
                             self.sort_by = clicked_sort;
                             self.sort_ascending = true;
                         }
+                        self.update_filtered_entries();
                     }
 
                     let arrow = if self.sort_ascending { "(asc)" } else { "(desc)" };
@@ -781,7 +799,7 @@ impl ArchiveExtractorApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        let filtered = self.filtered_entries_owned();
+                        let filtered = &self.filtered_entries;
 
                         if filtered.is_empty() {
                             ui.add_space(20.0);
