@@ -15,10 +15,11 @@ fn main() {
         .format_target(false)
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
+    // Parse CLI arguments. If they specify --help or --version, clap handles it and exits.
+    let cli = cli::Cli::parse();
 
-    // If no CLI arguments, run GUI mode
-    if args.len() == 1 {
+    // If no archives and no action flags are specified, run GUI mode
+    if cli.archives.is_empty() && !cli.extract && !cli.list && !cli.info {
         #[cfg(feature = "gui")]
         {
             if let Err(e) = run_gui() {
@@ -33,8 +34,6 @@ fn main() {
         }
     } else {
         // Run CLI mode
-        let cli = cli::Cli::parse();
-
         if let Err(e) = cli::run(cli) {
             eprintln!("Error: {}", e);
             std::process::exit(1);

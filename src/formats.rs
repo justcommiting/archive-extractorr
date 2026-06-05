@@ -18,55 +18,29 @@ pub fn format_name(format: ArchiveFormat) -> &'static str {
     }
 }
 
-/// Get format icon/emoji
+/// Get format icon/emoji representation (ASCII text)
 pub fn format_icon(format: ArchiveFormat) -> &'static str {
     match format {
-        ArchiveFormat::Zip => "📦",
-        ArchiveFormat::Tar => "📋",
-        ArchiveFormat::Gzip => "🗜️",
-        ArchiveFormat::Bzip2 => "🗜️",
-        ArchiveFormat::Xz => "🗜️",
-        ArchiveFormat::Rar => "📦",
-        ArchiveFormat::SevenZip => "🗜️",
-        ArchiveFormat::Zstd => "⚡",
-        ArchiveFormat::Brotli => "🥨",
-        ArchiveFormat::Lz4 => "💨",
-        ArchiveFormat::Unknown => "❓",
+        ArchiveFormat::Zip => "[ZIP]",
+        ArchiveFormat::Tar => "[TAR]",
+        ArchiveFormat::Gzip => "[GZIP]",
+        ArchiveFormat::Bzip2 => "[BZIP2]",
+        ArchiveFormat::Xz => "[XZ]",
+        ArchiveFormat::Rar => "[RAR]",
+        ArchiveFormat::SevenZip => "[7Z]",
+        ArchiveFormat::Zstd => "[ZSTD]",
+        ArchiveFormat::Brotli => "[BROTLI]",
+        ArchiveFormat::Lz4 => "[LZ4]",
+        ArchiveFormat::Unknown => "[UNK]",
     }
 }
 
-/// Get file icon based on entry type and extension
+/// Get file icon based on entry type (ASCII representation)
 pub fn file_icon(entry: &ArchiveEntry) -> &'static str {
     if entry.is_dir {
-        return "📁";
+        return "[DIR]";
     }
-
-    let ext = entry
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "txt" | "md" | "rst" | "readme" => "📄",
-        "pdf" => "📕",
-        "doc" | "docx" => "📘",
-        "xls" | "xlsx" | "csv" => "📊",
-        "ppt" | "pptx" => "📊",
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "svg" | "webp" => "🖼️",
-        "mp3" | "wav" | "flac" | "aac" | "ogg" => "🎵",
-        "mp4" | "avi" | "mkv" | "mov" | "webm" => "🎬",
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "zstd" | "br" | "lz4" => "📦",
-        "exe" | "msi" | "app" | "dmg" => "⚙️",
-        "sh" | "bash" | "zsh" | "fish" => "🔧",
-        "py" => "🐍",
-        "js" | "ts" | "jsx" | "tsx" => "📜",
-        "rs" | "go" | "c" | "cpp" | "h" | "hpp" => "⚙️",
-        "html" | "css" | "scss" => "🌐",
-        "json" | "xml" | "yaml" | "yml" | "toml" => "⚙️",
-        _ => "📄",
-    }
+    "[FILE]"
 }
 
 /// Format file size for display
@@ -119,10 +93,10 @@ mod tests {
 
     #[test]
     fn test_format_icon() {
-        assert_eq!(format_icon(ArchiveFormat::Zip), "📦");
-        assert_eq!(format_icon(ArchiveFormat::Rar), "📦");
-        assert_eq!(format_icon(ArchiveFormat::Tar), "📋");
-        assert_eq!(format_icon(ArchiveFormat::Unknown), "❓");
+        assert_eq!(format_icon(ArchiveFormat::Zip), "[ZIP]");
+        assert_eq!(format_icon(ArchiveFormat::Rar), "[RAR]");
+        assert_eq!(format_icon(ArchiveFormat::Tar), "[TAR]");
+        assert_eq!(format_icon(ArchiveFormat::Unknown), "[UNK]");
     }
 
     #[test]
@@ -134,7 +108,7 @@ mod tests {
             compressed_size: 0,
             path: Path::new("folder").to_path_buf(),
         };
-        assert_eq!(file_icon(&dir_entry), "📁");
+        assert_eq!(file_icon(&dir_entry), "[DIR]");
     }
 
     #[test]
@@ -146,7 +120,7 @@ mod tests {
             compressed_size: 0,
             path: Path::new("file.txt").to_path_buf(),
         };
-        assert_eq!(file_icon(&txt_entry), "📄");
+        assert_eq!(file_icon(&txt_entry), "[FILE]");
 
         let pdf_entry = ArchiveEntry {
             name: "document.pdf".to_string(),
@@ -155,43 +129,7 @@ mod tests {
             compressed_size: 0,
             path: Path::new("document.pdf").to_path_buf(),
         };
-        assert_eq!(file_icon(&pdf_entry), "📕");
-
-        let jpg_entry = ArchiveEntry {
-            name: "photo.jpg".to_string(),
-            is_dir: false,
-            size: 0,
-            compressed_size: 0,
-            path: Path::new("photo.jpg").to_path_buf(),
-        };
-        assert_eq!(file_icon(&jpg_entry), "🖼️");
-
-        let mp3_entry = ArchiveEntry {
-            name: "song.mp3".to_string(),
-            is_dir: false,
-            size: 0,
-            compressed_size: 0,
-            path: Path::new("song.mp3").to_path_buf(),
-        };
-        assert_eq!(file_icon(&mp3_entry), "🎵");
-
-        let mp4_entry = ArchiveEntry {
-            name: "video.mp4".to_string(),
-            is_dir: false,
-            size: 0,
-            compressed_size: 0,
-            path: Path::new("video.mp4").to_path_buf(),
-        };
-        assert_eq!(file_icon(&mp4_entry), "🎬");
-
-        let rs_entry = ArchiveEntry {
-            name: "code.rs".to_string(),
-            is_dir: false,
-            size: 0,
-            compressed_size: 0,
-            path: Path::new("code.rs").to_path_buf(),
-        };
-        assert_eq!(file_icon(&rs_entry), "⚙️");
+        assert_eq!(file_icon(&pdf_entry), "[FILE]");
     }
 
     #[test]

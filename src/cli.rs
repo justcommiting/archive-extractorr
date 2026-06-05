@@ -1,5 +1,5 @@
 use crate::extractor::{self, ArchiveFormat};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -9,55 +9,65 @@ use std::sync::Arc;
 #[command(name = "archive-extractor")]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    #[command(subcommand)]
-    pub command: Commands,
+    /// Paths to the archive files
+    #[arg(value_name = "ARCHIVES")]
+    pub archives: Vec<PathBuf>,
+
+    /// Extract archives (default action)
+    #[arg(short = 'x', long = "extract")]
+    pub extract: bool,
+
+    /// List contents of archives
+    #[arg(short = 'l', long = "list")]
+    pub list: bool,
+
+    /// Show information about archives
+    #[arg(short = 'i', long = "info")]
+    pub info: bool,
+
+    /// Destination directory (only works when extracting a single archive)
+    #[arg(short, long, value_name = "DIR")]
+    pub output: Option<PathBuf>,
 
     /// Enable verbose output
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     pub verbose: bool,
 
     /// Password for encrypted archives
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     pub password: Option<String>,
 }
 
-#[derive(Subcommand)]
-pub enum Commands {
-    /// Extract an archive to a destination
-    Extract {
-        /// Path to the archive file
-        #[arg(value_name = "ARCHIVE")]
-        archive: PathBuf,
-
-        /// Destination directory (defaults to archive name in same directory)
-        #[arg(short, long, value_name = "DIR")]
-        output: Option<PathBuf>,
-    },
-    /// List contents of an archive
-    List {
-        /// Path to the archive file
-        #[arg(value_name = "ARCHIVE")]
-        archive: PathBuf,
-    },
-    /// Show information about an archive
-    Info {
-        /// Path to the archive file
-        #[arg(value_name = "ARCHIVE")]
-        archive: PathBuf,
-    },
-}
-
 pub fn run(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
-        Commands::Extract { archive, output } => run_extract(
-            &archive,
-            output.as_deref(),
-            cli.password.as_deref(),
-            cli.verbose,
-        ),
-        Commands::List { archive } => run_list(&archive, cli.verbose),
-        Commands::Info { archive } => run_info(&archive, cli.verbose),
+    if cli.archives.is_empty() {
+        anyhow::bail!("No archive files specified. Use --help for usage.");
     }
+
+    let action_list = cli.list;
+    let action_info = cli.info;
+    let action_extract = cli.extract || (!action_list && !action_info);
+
+    if action_list {
+        for archive in &cli.archives {
+            run_list(archive, cli.verbose)?;
+        }
+    } else if action_info {
+        for archive in &cli.archives {
+            run_info(archive, cli.verbose)?;
+        }
+    } else if action_extract {
+        use rayon::prelude::*;
+        cli.archives.par_iter().try_for_each(|archive| {
+            run_extract(
+                archive,
+                cli.output.as_deref(),
+                cli.password.as_deref(),
+                cli.verbose,
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 fn run_extract(
@@ -78,6 +88,11 @@ fn run_extract(
     // Determine destination
     let dest: PathBuf = if let Some(out) = output {
         out.to_path_buf()
+    } else if format.is_single_file() {
+        archive
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     } else if let Some(stem) = archive.file_stem() {
         archive
             .parent()
@@ -117,7 +132,7 @@ fn run_extract(
             if verbose {
                 println!("Extracted {} files to {}", count, dest.display());
             } else {
-                println!("Extracted {} files", count);
+                println!("Extracted {} files from {}", count, archive.display());
             }
             Ok(())
         }

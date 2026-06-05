@@ -8,6 +8,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SortBy {
+    Name,
+    Size,
+    Type,
+}
+
+impl Default for SortBy {
+    fn default() -> Self {
+        Self::Name
+    }
+}
+
 /// Application state
 pub struct ArchiveExtractorApp {
     archive_path: Option<PathBuf>,
@@ -31,6 +44,15 @@ pub struct ArchiveExtractorApp {
     show_password: bool,
     request_password_focus: bool, // <-- ADDED
     error_message: Arc<Mutex<Option<String>>>,
+    
+    // Sorting state
+    sort_by: SortBy,
+    sort_ascending: bool,
+
+    // Extraction metrics
+    extraction_start_time: Option<std::time::Instant>,
+    extraction_speed: String,
+    extraction_elapsed: String,
 }
 
 impl Default for ArchiveExtractorApp {
@@ -57,6 +79,11 @@ impl Default for ArchiveExtractorApp {
             show_password: false,
             request_password_focus: false, // <-- ADDED
             error_message: Arc::new(Mutex::new(None)),
+            sort_by: SortBy::Name,
+            sort_ascending: true,
+            extraction_start_time: None,
+            extraction_speed: String::new(),
+            extraction_elapsed: String::new(),
         }
     }
 }
@@ -135,8 +162,16 @@ impl ArchiveExtractorApp {
         // Set default destination
         if let Some(parent) = path.parent() {
             let mut dest = parent.to_path_buf();
-            if let Some(name) = path.file_stem() {
-                dest.push(name);
+            if let Some(format) = self.archive_format {
+                if !format.is_single_file() {
+                    if let Some(name) = path.file_stem() {
+                        dest.push(name);
+                    }
+                }
+            } else {
+                if let Some(name) = path.file_stem() {
+                    dest.push(name);
+                }
             }
             self.destination_path = Some(dest.clone());
             self.destination_edit = dest.display().to_string();
@@ -148,14 +183,40 @@ impl ArchiveExtractorApp {
     }
 
     fn filtered_entries_owned(&self) -> Vec<&ArchiveEntry> {
-        if self.search_query.is_empty() {
-            return self.archive_entries.iter().collect();
-        }
-        let search_lower = self.search_query.to_lowercase();
-        self.archive_entries
-            .iter()
-            .filter(|e| e.name.to_lowercase().contains(&search_lower))
-            .collect()
+        let mut entries: Vec<&ArchiveEntry> = if self.search_query.is_empty() {
+            self.archive_entries.iter().collect()
+        } else {
+            let search_lower = self.search_query.to_lowercase();
+            self.archive_entries
+                .iter()
+                .filter(|e| e.name.to_lowercase().contains(&search_lower))
+                .collect()
+        };
+
+        entries.sort_by(|a, b| {
+            let ord = match self.sort_by {
+                SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortBy::Size => a.size.cmp(&b.size),
+                SortBy::Type => {
+                    let a_dir = a.is_dir;
+                    let b_dir = b.is_dir;
+                    if a_dir != b_dir {
+                        b_dir.cmp(&a_dir)
+                    } else {
+                        let ext_a = a.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                        let ext_b = b.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                        ext_a.cmp(&ext_b)
+                    }
+                }
+            };
+            if self.sort_ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+
+        entries
     }
 
     fn start_extraction(&mut self) {
@@ -186,6 +247,9 @@ impl ArchiveExtractorApp {
         self.progress_current.store(0, Ordering::Relaxed);
         self.progress_total.store(0, Ordering::Relaxed);
         self.password_error = false;
+        self.extraction_start_time = Some(std::time::Instant::now());
+        self.extraction_speed = String::new();
+        self.extraction_elapsed = String::new();
         // Clear any previous errors
         *error_message.lock().unwrap() = None;
 
@@ -223,10 +287,27 @@ impl ArchiveExtractorApp {
             self.extraction_status = format!("{} / {} files ", current, total);
         }
 
+        if let Some(start_time) = self.extraction_start_time {
+            let elapsed = start_time.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+            self.extraction_elapsed = format!("{:.1}s", elapsed_secs);
+            
+            if elapsed_secs > 0.1 && current > 0 {
+                let speed = current as f64 / elapsed_secs;
+                self.extraction_speed = format!("{:.1} files/s", speed);
+            }
+        }
+
         if let Some(handle) = &self.extraction_handle {
             if handle.is_finished() {
                 self.is_extracting = false;
                 self.extraction_handle = None;
+
+                let total_time_str = if let Some(start_time) = self.extraction_start_time {
+                    format!(" in {:.2}s", start_time.elapsed().as_secs_f32())
+                } else {
+                    String::new()
+                };
 
                 // Check if there was an error
                 let err = self.error_message.lock().unwrap().take();
@@ -254,7 +335,7 @@ impl ArchiveExtractorApp {
                     // Success
                     self.extraction_progress = 100.0;
                     self.extraction_status = String::from("Done!");
-                    self.status_message = String::from("Extraction complete");
+                    self.status_message = format!("Extraction complete{}", total_time_str);
                 }
             }
         }
@@ -311,7 +392,7 @@ impl ArchiveExtractorApp {
                                 formats::format_name(fmt)
                             );
                             if self.is_encrypted {
-                                info_text.push_str(" 🔒 ");
+                                info_text.push_str(" [Encrypted] ");
                             }
                             ui.label(
                                 egui::RichText::new(info_text)
@@ -376,18 +457,19 @@ impl ArchiveExtractorApp {
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 10.0));
                 frame.show(ui, |ui| {
+                    let pass_color = if self.password_error {
+                        egui::Color32::from_rgb(240, 120, 120)
+                    } else {
+                        egui::Color32::from_rgb(220, 190, 80)
+                    };
+                    let pass_label = if self.password_error {
+                        "Password required (incorrect)"
+                    } else {
+                        "This archive is password protected"
+                    };
+
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🔒 ").size(16.0));
-                        let pass_label = if self.password_error {
-                            "Password required (incorrect)"
-                        } else {
-                            "This archive is password protected"
-                        };
-                        let pass_color = if self.password_error {
-                            egui::Color32::from_rgb(240, 120, 120)
-                        } else {
-                            egui::Color32::from_rgb(220, 190, 80)
-                        };
+                        ui.label(egui::RichText::new("[LOCKED] ").size(13.0).color(pass_color));
                         ui.label(
                             egui::RichText::new(pass_label)
                                 .size(13.0)
@@ -410,7 +492,7 @@ impl ArchiveExtractorApp {
                         let mut password_edit = egui::TextEdit::singleline(&mut self.password)
                             .id(password_id)
                             .password(!self.show_password)
-                            .desired_width(ui.available_width() - 50.0) // <-- IMPROVED: Responsive width
+                            .desired_width(ui.available_width() - 80.0) // <-- IMPROVED: Responsive width
                             .hint_text("Enter archive password");
 
                         if self.password_error {
@@ -430,7 +512,7 @@ impl ArchiveExtractorApp {
                             self.start_extraction();
                         }
 
-                        let toggle_label = if self.show_password { "🙈" } else { "👁️" };
+                        let toggle_label = if self.show_password { "Hide" } else { "Show" };
                         let toggle_tip = if self.show_password {
                             "Hide password"
                         } else {
@@ -438,7 +520,7 @@ impl ArchiveExtractorApp {
                         };
                         if ui.add(
                             egui::Button::new(toggle_label)
-                                .min_size(egui::vec2(32.0, 24.0))
+                                .min_size(egui::vec2(60.0, 24.0))
                                 .rounding(egui::Rounding::same(4.0)),
                         )
                         .on_hover_text(toggle_tip)
@@ -458,27 +540,42 @@ impl ArchiveExtractorApp {
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                ui.available_size()
-                                    - egui::vec2(if self.is_extracting { 90.0 } else { 0.0 }, 0.0),
-                                egui::ProgressBar::new(self.extraction_progress / 100.0)
-                                    .desired_width(ui.available_size().x)
-                                    .show_percentage()
-                                    .text(&self.extraction_status)
-                                    .rounding(egui::Rounding::same(4.0)),
-                            );
-
-                            if self.is_extracting
-                                && ui.add(
-                                    egui::Button::new("✕ Cancel")
-                                        .min_size(egui::vec2(80.0, 24.0))
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    ui.available_size()
+                                        - egui::vec2(if self.is_extracting { 90.0 } else { 0.0 }, 0.0),
+                                    egui::ProgressBar::new(self.extraction_progress / 100.0)
+                                        .desired_width(ui.available_size().x)
+                                        .show_percentage()
+                                        .text(&self.extraction_status)
                                         .rounding(egui::Rounding::same(4.0)),
-                                )
-                                .on_hover_text("Esc")
-                                .clicked()
-                            {
-                                self.cancel_flag.store(true, Ordering::Relaxed);
+                                );
+
+                                if self.is_extracting
+                                    && ui.add(
+                                        egui::Button::new("Cancel")
+                                            .min_size(egui::vec2(80.0, 24.0))
+                                            .rounding(egui::Rounding::same(4.0)),
+                                    )
+                                    .on_hover_text("Esc")
+                                    .clicked()
+                                {
+                                    self.cancel_flag.store(true, Ordering::Relaxed);
+                                }
+                            });
+
+                            if self.is_extracting {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("Elapsed: {}", self.extraction_elapsed))
+                                        .size(11.0).color(egui::Color32::GRAY));
+                                    ui.add_space(16.0);
+                                    if !self.extraction_speed.is_empty() {
+                                        ui.label(egui::RichText::new(format!("Speed: {}", self.extraction_speed))
+                                            .size(11.0).color(egui::Color32::GRAY));
+                                    }
+                                });
                             }
                         });
                     });
@@ -491,7 +588,7 @@ impl ArchiveExtractorApp {
             ui.horizontal(|ui| {
                 if self.archive_path.is_none() {
                     if ui.add(
-                        egui::Button::new("📂 Open Archive")
+                        egui::Button::new("Open Archive")
                             .min_size(egui::vec2(130.0, 32.0))
                             .rounding(egui::Rounding::same(6.0)),
                     )
@@ -507,7 +604,7 @@ impl ArchiveExtractorApp {
                     }
                 } else if !self.is_extracting && self.extraction_progress < 100.0 {
                     if ui.add(
-                        egui::Button::new("📂 Change Archive")
+                        egui::Button::new("Change Archive")
                             .min_size(egui::vec2(130.0, 32.0))
                             .rounding(egui::Rounding::same(6.0)),
                     )
@@ -525,7 +622,7 @@ impl ArchiveExtractorApp {
                     ui.add_space(8.0);
 
                     if ui.add(
-                        egui::Button::new("📁 Destination")
+                        egui::Button::new("Destination")
                             .min_size(egui::vec2(110.0, 32.0))
                             .rounding(egui::Rounding::same(6.0)),
                     )
@@ -541,9 +638,9 @@ impl ArchiveExtractorApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let needs_password = self.is_encrypted && self.password.is_empty();
                         let extract_label = if needs_password {
-                            "🔒 Extract"
+                            "Locked Extract"
                         } else {
-                            "▶ Extract"
+                            "Extract"
                         };
                         let btn = egui::Button::new(
                             egui::RichText::new(extract_label)
@@ -572,7 +669,7 @@ impl ArchiveExtractorApp {
                     });
                 } else if self.extraction_progress >= 100.0 {
                     if ui.add(
-                        egui::Button::new("📂 Open Another")
+                        egui::Button::new("Open Another")
                             .min_size(egui::vec2(130.0, 32.0))
                             .rounding(egui::Rounding::same(6.0)),
                     )
@@ -590,7 +687,7 @@ impl ArchiveExtractorApp {
 
                     if let Some(ref dest) = self.destination_path {
                         if ui.add(
-                            egui::Button::new("📂 Open Destination")
+                            egui::Button::new("Open Destination")
                                 .min_size(egui::vec2(140.0, 32.0))
                                 .rounding(egui::Rounding::same(6.0)),
                         )
@@ -623,13 +720,13 @@ impl ArchiveExtractorApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let _search_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("🔍 Search files...")
+                                .hint_text("Search files...")
                                 .desired_width(200.0),
                         );
 
                         if !self.search_query.is_empty()
                             && ui.add(
-                                egui::Button::new("✕")
+                                egui::Button::new("X")
                                     .min_size(egui::vec2(20.0, 20.0))
                                     .rounding(egui::Rounding::same(4.0)),
                             )
@@ -638,6 +735,44 @@ impl ArchiveExtractorApp {
                             self.search_query.clear();
                         }
                     });
+                });
+
+                ui.add_space(6.0);
+
+                // Sorting row
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Sort by:")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(140, 140, 150)),
+                    );
+
+                    let mut sort_clicked = None;
+                    if ui.selectable_label(self.sort_by == SortBy::Name, "Name").clicked() {
+                        sort_clicked = Some(SortBy::Name);
+                    }
+                    if ui.selectable_label(self.sort_by == SortBy::Size, "Size").clicked() {
+                        sort_clicked = Some(SortBy::Size);
+                    }
+                    if ui.selectable_label(self.sort_by == SortBy::Type, "Type").clicked() {
+                        sort_clicked = Some(SortBy::Type);
+                    }
+
+                    if let Some(clicked_sort) = sort_clicked {
+                        if self.sort_by == clicked_sort {
+                            self.sort_ascending = !self.sort_ascending;
+                        } else {
+                            self.sort_by = clicked_sort;
+                            self.sort_ascending = true;
+                        }
+                    }
+
+                    let arrow = if self.sort_ascending { "(asc)" } else { "(desc)" };
+                    ui.label(
+                        egui::RichText::new(arrow)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(120, 120, 130)),
+                    );
                 });
 
                 ui.add_space(6.0);
@@ -653,7 +788,7 @@ impl ArchiveExtractorApp {
                             ui.horizontal(|ui| {
                                 ui.add_space(10.0);
                                 ui.label(
-                                    egui::RichText::new("🔍 No files match your search")
+                                    egui::RichText::new("No files match your search")
                                         .size(13.0)
                                         .color(egui::Color32::from_rgb(140, 140, 150)),
                                 );
@@ -719,11 +854,12 @@ impl ArchiveExtractorApp {
                     ui.vertical(|ui| {
                         ui.add_space(20.0);
 
-                        // Large archive icon
+                        // Large text heading
                         ui.label(
-                            egui::RichText::new("📦")
-                                .size(48.0)
-                                .color(egui::Color32::from_rgb(150, 180, 220)),
+                            egui::RichText::new("[ ARCHIVE EXTRACTOR ]")
+                                .size(28.0)
+                                .color(egui::Color32::from_rgb(150, 180, 220))
+                                .strong(),
                         );
 
                         ui.add_space(12.0);
@@ -746,7 +882,7 @@ impl ArchiveExtractorApp {
 
                         if ui.add(
                             egui::Button::new(
-                                egui::RichText::new("📂 Browse Files")
+                                egui::RichText::new("Browse Files")
                                     .size(14.0)
                                     .color(egui::Color32::WHITE),
                             )

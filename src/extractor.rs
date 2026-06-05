@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::GzDecoder;
-use log::error;
 use lz4_flex::frame::FrameDecoder as Lz4Decoder;
-use sevenz_rust::SevenZArchiveEntry;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tar::Archive;
@@ -68,30 +66,23 @@ pub fn is_rar_encrypted(path: &Path) -> bool {
 
 /// Check if a 7z archive is password protected
 pub fn is_sevenzip_encrypted(path: &Path) -> bool {
-    let temp_dir = std::env::temp_dir().join("archive-extractor-7z-encrypted-check");
-    let _ = fs::remove_dir_all(&temp_dir);
-
-    let result = sevenz_rust::decompress_file_with_extract_fn(
-        path,
-        &temp_dir,
-        &mut |_entry: &SevenZArchiveEntry,
-              reader: &mut dyn Read,
-              _dest: &PathBuf|
-              -> Result<bool, sevenz_rust::Error> {
-            // Touch the stream so missing-password failures surface as explicit errors.
-            let mut buf = [0u8; 1];
-            let _ = reader.read(&mut buf).map_err(sevenz_rust::Error::io)?;
-            Ok(false)
-        },
-    );
-
-    let _ = fs::remove_dir_all(&temp_dir);
-
-    matches!(
-        result,
-        Err(sevenz_rust::Error::PasswordRequired)
-            | Err(sevenz_rust::Error::MaybeBadPassword(_))
-    )
+    use sevenz_rust::{SevenZReader, Password};
+    match SevenZReader::open(path, Password::default()) {
+        Err(sevenz_rust::Error::PasswordRequired) | Err(sevenz_rust::Error::MaybeBadPassword(_)) => true,
+        Ok(mut reader) => {
+            // Check if file data is encrypted by trying to read from the first entry
+            let res = reader.for_each_entries(|_entry, r| {
+                let mut buf = [0u8; 1];
+                let _ = r.read(&mut buf).map_err(sevenz_rust::Error::io)?;
+                Ok(false) // stop after first entry
+            });
+            matches!(
+                res,
+                Err(sevenz_rust::Error::PasswordRequired) | Err(sevenz_rust::Error::MaybeBadPassword(_))
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Supported archive formats
@@ -111,6 +102,18 @@ pub enum ArchiveFormat {
 }
 
 impl ArchiveFormat {
+    pub fn is_single_file(self) -> bool {
+        matches!(
+            self,
+            ArchiveFormat::Gzip
+                | ArchiveFormat::Bzip2
+                | ArchiveFormat::Xz
+                | ArchiveFormat::Zstd
+                | ArchiveFormat::Brotli
+                | ArchiveFormat::Lz4
+        )
+    }
+
     pub fn from_extension(path: &Path) -> Self {
         match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
             "zip" => ArchiveFormat::Zip,
@@ -203,27 +206,32 @@ pub fn extract_zip(
     cancel_flag: Arc<AtomicBool>,
     password: Option<&str>,
 ) -> Result<usize> {
-    let file = File::open(path).context("Failed to open ZIP file")?;
-    let mut archive = ZipArchive::new(file).context("Invalid ZIP archive")?;
-    let total_files = archive.len();
+    use rayon::prelude::*;
+
+    let total_files = {
+        let file = File::open(path).context("Failed to open ZIP file")?;
+        let archive = ZipArchive::new(file).context("Invalid ZIP archive")?;
+        archive.len()
+    };
     total.store(total_files, Ordering::Relaxed);
 
-    let mut extracted = 0;
+    let created_dirs = std::sync::Mutex::new(std::collections::HashSet::new());
 
-    for i in 0..archive.len() {
+    (0..total_files).into_par_iter().try_for_each(|i| {
         if cancel_flag.load(Ordering::Relaxed) {
-            anyhow::bail!("Extraction cancelled");
+            return Err(anyhow::anyhow!("Extraction cancelled"));
         }
 
-        // Try to get the entry, using password if needed
+        // Each thread opens its own file handle and zip archive instance
+        let file = File::open(path).context("Failed to open ZIP file")?;
+        let mut archive = ZipArchive::new(file).context("Invalid ZIP archive")?;
+
         let mut entry = if let Some(pwd) = password {
-            // Use password for all entries - by_index_decrypt handles both encrypted and plain
             match archive.by_index_decrypt(i, pwd.as_bytes()) {
                 Ok(result) => result.map_err(|_| anyhow::anyhow!("Invalid password"))?,
                 Err(e) => return Err(e).context("Failed to decrypt entry"),
             }
         } else {
-            // No password - try regular access
             match archive.by_index(i) {
                 Ok(e) => e,
                 Err(zip::result::ZipError::UnsupportedArchive(_)) => {
@@ -239,38 +247,32 @@ pub fn extract_zip(
         let out_path = dest.join(entry_path);
 
         if entry.name().ends_with('/') {
-            if let Err(e) = fs::create_dir_all(&out_path).context("Failed to create directory") {
-                error!("Failed to create directory {:?}: {}", out_path, e);
-                continue;
+            let mut created_dirs_lock = created_dirs.lock().unwrap();
+            if !created_dirs_lock.contains(&out_path) {
+                fs::create_dir_all(&out_path).context("Failed to create directory")?;
+                created_dirs_lock.insert(out_path.clone());
             }
         } else {
             if let Some(parent) = out_path.parent() {
-                if let Err(e) =
-                    fs::create_dir_all(parent).context("Failed to create parent directory")
-                {
-                    error!("Failed to create parent directory {:?}: {}", parent, e);
-                    continue;
+                let mut created_dirs_lock = created_dirs.lock().unwrap();
+                if !created_dirs_lock.contains(parent) {
+                    fs::create_dir_all(parent).context("Failed to create parent directory")?;
+                    created_dirs_lock.insert(parent.to_path_buf());
                 }
             }
-            let mut outfile = match File::create(&out_path).context("Failed to create output file")
-            {
-                Ok(f) => BufWriter::new(f),
-                Err(e) => {
-                    error!("Failed to create output file {:?}: {}", out_path, e);
-                    continue;
-                }
-            };
-            if let Err(e) = io::copy(&mut entry, &mut outfile).context("Failed to extract file") {
-                error!("Failed to extract file {:?}: {}", out_path, e);
-                continue;
-            }
+
+            let mut outfile = BufWriter::new(
+                File::create(&out_path).context("Failed to create output file")?
+            );
+            io::copy(&mut entry, &mut outfile).context("Failed to extract file")?;
+            outfile.flush().context("Failed to flush output file")?;
         }
 
-        extracted += 1;
         progress.fetch_add(1, Ordering::Relaxed);
-    }
+        Ok(())
+    })?;
 
-    Ok(extracted)
+    Ok(total_files)
 }
 
 /// Extract a TAR archive
@@ -425,39 +427,70 @@ pub fn extract_xz(
 pub fn extract_sevenzip(
     path: &Path,
     dest: &Path,
-    _progress: Arc<AtomicUsize>,
+    progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     cancel_flag: Arc<AtomicBool>,
-    _password: Option<&str>,
+    password: Option<&str>,
 ) -> Result<usize> {
+    use sevenz_rust::{SevenZReader, Password};
+
     if cancel_flag.load(Ordering::Relaxed) {
         anyhow::bail!("Extraction cancelled");
     }
 
-    // decompress_file extracts the entire 7z archive to dest preserving internal paths
-    sevenz_rust::decompress_file(path, dest)
-        .context("Failed to extract 7z archive")?;
+    let p = match password {
+        Some(pwd) => Password::from(pwd),
+        None => Password::default(),
+    };
 
-    // Count the extracted entries for progress reporting
-    let entry_count = count_extracted_files(dest);
-    total.store(entry_count, Ordering::Relaxed);
+    let mut reader = SevenZReader::open(path, p).context("Failed to open 7z archive")?;
+    let total_entries = reader.archive().files.len();
+    total.store(total_entries, Ordering::Relaxed);
 
-    Ok(entry_count)
-}
+    let mut extracted = 0;
+    let mut created_dirs = std::collections::HashSet::new();
 
-/// Count files in an extraction directory (used for 7z post-extraction counting)
-fn count_extracted_files(dir: &Path) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                count += count_extracted_files(&entry.path());
-            } else {
-                count += 1;
+    let res = reader.for_each_entries(|entry, file_reader| {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err(sevenz_rust::Error::other("Extraction cancelled"));
+        }
+
+        let out_path = dest.join(&entry.name);
+
+        if entry.is_directory() {
+            if !created_dirs.contains(&out_path) {
+                fs::create_dir_all(&out_path).map_err(sevenz_rust::Error::io)?;
+                created_dirs.insert(out_path.clone());
             }
+        } else {
+            if let Some(parent) = out_path.parent() {
+                if !created_dirs.contains(parent) {
+                    fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
+                    created_dirs.insert(parent.to_path_buf());
+                }
+            }
+
+            let mut outfile = BufWriter::new(
+                File::create(&out_path).map_err(sevenz_rust::Error::io)?
+            );
+            std::io::copy(file_reader, &mut outfile).map_err(sevenz_rust::Error::io)?;
+            outfile.flush().map_err(sevenz_rust::Error::io)?;
+        }
+
+        extracted += 1;
+        progress.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    });
+
+    match res {
+        Ok(_) => Ok(extracted),
+        Err(e) => {
+            if e.to_string().contains("cancelled") {
+                anyhow::bail!("Extraction cancelled");
+            }
+            Err(anyhow::anyhow!("Failed to extract 7z archive: {}", e))
         }
     }
-    count
 }
 
 /// Extract a Zstandard file
@@ -619,6 +652,7 @@ pub fn extract_rar(
         .context("Failed to open RAR for processing")?;
 
     let mut extracted = 0;
+    let mut created_dirs = std::collections::HashSet::new();
 
     loop {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -637,11 +671,17 @@ pub fn extract_rar(
         let out_path = dest.join(&entry_path);
 
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).context("Failed to create directory")?;
+            if !created_dirs.contains(parent) {
+                fs::create_dir_all(parent).context("Failed to create directory")?;
+                created_dirs.insert(parent.to_path_buf());
+            }
         }
 
         if header.is_directory() {
-            fs::create_dir_all(&out_path).ok();
+            if !created_dirs.contains(&out_path) {
+                fs::create_dir_all(&out_path).ok();
+                created_dirs.insert(out_path.clone());
+            }
         } else {
             // Extract the file using extract_with_base
             process_archive = archive_with_header
@@ -719,57 +759,22 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
             }])
         }
         ArchiveFormat::SevenZip => {
-            let file = File::open(path)?;
-            let metadata = file.metadata()?;
-            let temp_dir = std::env::temp_dir().join("archive-extractor-7z-list");
-            let _ = fs::remove_dir_all(&temp_dir);
+            use sevenz_rust::{SevenZReader, Password};
+            let reader = SevenZReader::open(path, Password::default())
+                .map_err(|e| anyhow::anyhow!("Failed to list 7z archive: {}", e))?;
+            let archive = reader.archive();
             let mut entries = Vec::new();
-            let path_clone = path.to_path_buf();
-            let list_result = sevenz_rust::decompress_file_with_extract_fn(
-                &path_clone,
-                &temp_dir,
-                &mut |entry: &SevenZArchiveEntry, reader: &mut dyn Read, _dest: &PathBuf| -> Result<bool, sevenz_rust::Error> {
-                    let name = entry.name().to_string();
-                    entries.push(ArchiveEntry {
-                        name: name.clone(),
-                        is_dir: entry.is_directory(),
-                        size: entry.size(),
-                        compressed_size: 0,
-                        path: std::path::Path::new(&name).to_path_buf(),
-                    });
-                    // Skip actual extraction while still surfacing read/decrypt errors.
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match reader.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(_) => {}
-                            Err(e) => return Err(sevenz_rust::Error::io(e)),
-                        }
-                    }
-                    Ok(false)
-                },
-            );
-            let _ = fs::remove_dir_all(&temp_dir);
-
-            if let Err(e) = list_result {
-                return Err(anyhow::anyhow!("Failed to list 7z archive: {}", e));
+            for entry in &archive.files {
+                let name = entry.name.to_string();
+                entries.push(ArchiveEntry {
+                    name: name.clone(),
+                    is_dir: entry.is_directory(),
+                    size: entry.size,
+                    compressed_size: entry.compressed_size,
+                    path: std::path::Path::new(&name).to_path_buf(),
+                });
             }
-
-            if entries.is_empty() {
-                Ok(vec![ArchiveEntry {
-                    name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    is_dir: false,
-                    size: metadata.len(),
-                    compressed_size: metadata.len(),
-                    path: path.to_path_buf(),
-                }])
-            } else {
-                Ok(entries)
-            }
+            Ok(entries)
         }
         ArchiveFormat::Rar => {
             let path_str = path.to_string_lossy().to_string();
@@ -947,3 +952,4 @@ mod tests {
         assert!(dest.exists());
     }
 }
+
