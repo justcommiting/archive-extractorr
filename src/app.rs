@@ -278,7 +278,7 @@ impl ArchiveExtractorApp {
 
     fn filter_entries(&mut self) {
         if self.search_query.is_empty() {
-            self.sorted_indices = (0..self.archive_entries.len()).collect();
+            self.sort_entries();
         } else {
             let search_lower = self.search_query.to_lowercase();
             self.sorted_indices.retain(|&i| {
