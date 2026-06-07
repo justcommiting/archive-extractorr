@@ -283,6 +283,7 @@ dependencies = [
  "flate2",
  "log",
  "lz4_flex",
+ "memmap2",
  "open",
  "parking_lot",
  "rayon",

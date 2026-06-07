@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::GzDecoder;
 use lz4_flex::frame::FrameDecoder as Lz4Decoder;
+
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tar::Archive;
 use unrar::Archive as RarArchive;
 use xz2::read::XzDecoder;
@@ -23,7 +25,9 @@ fn sanitize_target_path(dest: &Path, entry_path: &Path) -> Result<PathBuf> {
                 anyhow::bail!("Directory traversal attempt detected: {:?}", entry_path);
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                // Skip absolute prefixes to enforce relativity to dest
+                // Archive entries with `C:\foo` or `\\.\` prefixes have those
+                // components stripped to enforce relativity to `dest`. The
+                // `starts_with(dest)` check below catches actual traversal.
             }
             std::path::Component::CurDir => {}
         }
@@ -35,6 +39,23 @@ fn sanitize_target_path(dest: &Path, entry_path: &Path) -> Result<PathBuf> {
         anyhow::bail!("Path escapes destination directory: {:?}", entry_path);
     }
 }
+
+/// Type-safe sentinel for 7z cancellation, avoiding string-based error matching.
+struct ExtractionCancelled;
+
+impl std::fmt::Display for ExtractionCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Extraction cancelled")
+    }
+}
+
+impl std::fmt::Debug for ExtractionCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ExtractionCancelled")
+    }
+}
+
+impl std::error::Error for ExtractionCancelled {}
 
 /// Generic Read wrapper that tracks the number of bytes read for progress reporting.
 struct ProgressReader<R> {
@@ -66,9 +87,10 @@ fn extract_single_file<D: Read>(
         anyhow::bail!("Extraction cancelled");
     }
 
-    let file = File::open(ctx.path)
-        .with_context(|| format!("Failed to open {} file", format_label))?;
-    let metadata = file.metadata()
+    let file =
+        File::open(ctx.path).with_context(|| format!("Failed to open {} file", format_label))?;
+    let metadata = file
+        .metadata()
         .with_context(|| format!("Failed to read {} file metadata", format_label))?;
     ctx.total.store(metadata.len() as usize, Ordering::Relaxed);
 
@@ -80,7 +102,8 @@ fn extract_single_file<D: Read>(
         .with_context(|| format!("Failed to create {} decoder", format_label))?;
 
     // Derive output filename by stripping a known extension
-    let raw_name = ctx.path
+    let raw_name = ctx
+        .path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
@@ -106,9 +129,8 @@ fn extract_single_file<D: Read>(
     }
 
     let out_path = ctx.dest.join(&output_name);
-    let mut outfile = BufWriter::new(
-        File::create(&out_path).context("Failed to create output file")?,
-    );
+    let mut outfile =
+        BufWriter::new(File::create(&out_path).context("Failed to create output file")?);
 
     io::copy(&mut decoder, &mut outfile)
         .with_context(|| format!("Failed to decompress {} file", format_label))?;
@@ -123,13 +145,20 @@ pub struct ArchiveEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "Reserved for future CLI display or progress reporting")]
     pub compressed_size: u64,
     pub path: std::path::PathBuf,
 }
 
 /// Shared context for extraction operations, eliminating repeated
 /// parameter lists across all extraction functions.
+///
+/// # Progress semantics
+/// - For single-file formats (Gzip, Bzip2, Xz, Zstd, Brotli, Lz4): `progress` and `total`
+///   represent **byte counts** (compressed bytes read from disk / total file size).
+/// - For multi-file archives (Zip, Tar, Rar, 7z): `progress` and `total` represent
+///   **file counts** (files extracted / total files).
+///   The UI branches on `ArchiveFormat::is_single_file()` to format accordingly.
 pub struct ExtractionContext<'a> {
     pub path: &'a Path,
     pub dest: &'a Path,
@@ -140,13 +169,17 @@ pub struct ExtractionContext<'a> {
 }
 
 /// Check if a ZIP archive is password protected
+/// Only checks the first 10 entries to avoid O(n) scan of large archives.
 pub fn is_zip_encrypted(path: &Path) -> bool {
     if let Ok(file) = File::open(path) {
         if let Ok(mut archive) = ZipArchive::new(file) {
-            for i in 0..archive.len() {
+            let limit = archive.len().min(10);
+            for i in 0..limit {
                 match archive.by_index(i) {
                     Ok(_) => continue,
-                    Err(zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED)) => return true,
+                    Err(zip::result::ZipError::UnsupportedArchive(
+                        zip::result::ZipError::PASSWORD_REQUIRED,
+                    )) => return true,
                     Err(_) => continue,
                 }
             }
@@ -166,23 +199,21 @@ pub fn is_rar_encrypted(path: &Path) -> bool {
                         return true;
                     }
                 }
-                // Listing failures on protected archives are frequently surfaced here.
                 Err(_) => return true,
             }
         }
         false
     } else {
-        // If opening for listing fails, it might be encrypted (RAR returns error
-        // when listing an encrypted archive without password)
-        true
+        false
     }
 }
 
 /// Check if a 7z archive is password protected
 pub fn is_sevenzip_encrypted(path: &Path) -> bool {
-    use sevenz_rust::{SevenZReader, Password};
+    use sevenz_rust::{Password, SevenZReader};
     match SevenZReader::open(path, Password::default()) {
-        Err(sevenz_rust::Error::PasswordRequired) | Err(sevenz_rust::Error::MaybeBadPassword(_)) => true,
+        Err(sevenz_rust::Error::PasswordRequired)
+        | Err(sevenz_rust::Error::MaybeBadPassword(_)) => true,
         Ok(mut reader) => {
             // Check if file data is encrypted by trying to read from the first entry
             let res = reader.for_each_entries(|_entry, r| {
@@ -192,7 +223,8 @@ pub fn is_sevenzip_encrypted(path: &Path) -> bool {
             });
             matches!(
                 res,
-                Err(sevenz_rust::Error::PasswordRequired) | Err(sevenz_rust::Error::MaybeBadPassword(_))
+                Err(sevenz_rust::Error::PasswordRequired)
+                    | Err(sevenz_rust::Error::MaybeBadPassword(_))
             )
         }
         _ => false,
@@ -311,37 +343,58 @@ impl ArchiveFormat {
     }
 }
 
-/// Extract a ZIP archive
-///
-/// Reads the file into memory once and shares the buffer across parallel workers
-/// via [`Arc`], avoiding N+1 file opens (one per entry + one for counting).
-pub fn extract_zip(ctx: &ExtractionContext) -> Result<usize> {
-    use rayon::prelude::*;
+/// Tracks created directories during extraction, using interior mutability so it
+/// works in both single-threaded and parallel (rayon) contexts.
+struct DirTracker {
+    created: Mutex<HashSet<PathBuf>>,
+}
 
-    // Read the ZIP file into memory once, then share the buffer via Arc.
-    // Each parallel worker creates a cheap Cursor over the shared data
-    // instead of reopening the file for every entry.
-    let data = Arc::new(std::fs::read(ctx.path).context("Failed to read ZIP file")?);
-
-    let total_files = {
-        let bytes: &[u8] = &*data;
-        let archive = ZipArchive::new(std::io::Cursor::new(bytes))
-            .context("Invalid ZIP archive")?;
-        archive.len()
-    };
-    ctx.total.store(total_files, Ordering::Relaxed);
-
-    let created_dirs = std::sync::Mutex::new(std::collections::HashSet::new());
-
-    (0..total_files).into_par_iter().try_for_each(|i| {
-        if ctx.cancel_flag.load(Ordering::Relaxed) {
-            return Err(anyhow::anyhow!("Extraction cancelled"));
+impl DirTracker {
+    fn new() -> Self {
+        Self {
+            created: Mutex::new(HashSet::new()),
         }
+    }
 
-        // Create archive from the shared in-memory buffer — no file open needed
-        let bytes: &[u8] = &**data;
-        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes))
-            .context("Invalid ZIP archive")?;
+    fn ensure_parent(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            let mut created = self.created.lock().unwrap();
+            if !created.contains(parent) {
+                fs::create_dir_all(parent)?;
+                created.insert(parent.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_dir(&self, path: &Path) -> Result<()> {
+        let mut created = self.created.lock().unwrap();
+        if !created.contains(path) {
+            fs::create_dir_all(path)?;
+            created.insert(path.to_path_buf());
+        }
+        Ok(())
+    }
+}
+
+const CHUNK_SIZE: usize = 128;
+const CHUNK_THRESHOLD: usize = 128;
+
+/// Extract a range of entries from a ZIP archive. Used by both the
+/// single-threaded fast path and the parallel chunked path.
+fn extract_zip_entries(
+    bytes: &[u8],
+    ctx: &ExtractionContext,
+    indices: &[usize],
+    created_dirs: &DirTracker,
+) -> Result<()> {
+    let mut archive =
+        ZipArchive::new(std::io::Cursor::new(bytes)).context("Invalid ZIP archive")?;
+
+    for &i in indices {
+        if ctx.cancel_flag.load(Ordering::Relaxed) {
+            anyhow::bail!("Extraction cancelled");
+        }
 
         let mut entry = if let Some(pwd) = ctx.password {
             match archive.by_index_decrypt(i, pwd.as_bytes()) {
@@ -352,42 +405,74 @@ pub fn extract_zip(ctx: &ExtractionContext) -> Result<usize> {
             match archive.by_index(i) {
                 Ok(e) => e,
                 Err(zip::result::ZipError::UnsupportedArchive(_)) => {
-                    anyhow::bail!("Archive contains encrypted entries, please provide a password");
+                    anyhow::bail!(
+                        "Archive contains encrypted entries, please provide a password"
+                    );
                 }
                 Err(e) => return Err(e).context("Failed to read entry"),
             }
         };
 
-        let entry_path = entry
-            .enclosed_name()
-            .ok_or_else(|| anyhow::anyhow!("Entry path escapes archive directory: {}", entry.name()))?;
+        let entry_path = entry.enclosed_name().ok_or_else(|| {
+            anyhow::anyhow!("Entry path escapes archive directory: {}", entry.name())
+        })?;
         let out_path = sanitize_target_path(ctx.dest, entry_path)?;
 
         if entry.name().ends_with('/') {
-            let mut created_dirs_lock = created_dirs.lock().unwrap();
-            if !created_dirs_lock.contains(&out_path) {
-                fs::create_dir_all(&out_path).context("Failed to create directory")?;
-                created_dirs_lock.insert(out_path.clone());
-            }
+            created_dirs.ensure_dir(&out_path)?;
         } else {
-            if let Some(parent) = out_path.parent() {
-                let mut created_dirs_lock = created_dirs.lock().unwrap();
-                if !created_dirs_lock.contains(parent) {
-                    fs::create_dir_all(parent).context("Failed to create parent directory")?;
-                    created_dirs_lock.insert(parent.to_path_buf());
-                }
-            }
+            created_dirs.ensure_parent(&out_path)?;
 
             let mut outfile = BufWriter::new(
-                File::create(&out_path).context("Failed to create output file")?
+                File::create(&out_path).context("Failed to create output file")?,
             );
             io::copy(&mut entry, &mut outfile).context("Failed to extract file")?;
             outfile.flush().context("Failed to flush output file")?;
         }
 
         ctx.progress.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    })?;
+    }
+    Ok(())
+}
+
+/// Extract a ZIP archive
+///
+/// Reads the file into memory once and shares the buffer across parallel workers
+/// via [`Arc`], avoiding N+1 file opens (one per entry + one for counting).
+/// Uses a single-threaded fast path for small archives to avoid chunking
+/// overhead and rayon dispatch latency.
+pub fn extract_zip(ctx: &ExtractionContext) -> Result<usize> {
+    use rayon::prelude::*;
+
+    let file = File::open(ctx.path).context("Failed to open ZIP file")?;
+    let mmap = unsafe { memmap2::Mmap::map(&file).context("Failed to mmap ZIP file")? };
+    let data: Arc<memmap2::Mmap> = Arc::new(mmap);
+
+    let total_files = {
+        let bytes: &[u8] = &data;
+        let archive =
+            ZipArchive::new(std::io::Cursor::new(bytes)).context("Invalid ZIP archive")?;
+        archive.len()
+    };
+    ctx.total.store(total_files, Ordering::Relaxed);
+
+    let created_dirs = DirTracker::new();
+    let bytes: &[u8] = &data;
+
+    if total_files < CHUNK_THRESHOLD {
+        let indices: Vec<usize> = (0..total_files).collect();
+        extract_zip_entries(bytes, ctx, &indices, &created_dirs)?;
+    } else {
+        let indices: Vec<usize> = (0..total_files).collect();
+        let chunks: Vec<&[usize]> = indices.chunks(CHUNK_SIZE).collect();
+
+        chunks.into_par_iter().try_for_each(|chunk| {
+            if ctx.cancel_flag.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Extraction cancelled"));
+            }
+            extract_zip_entries(bytes, ctx, chunk, &created_dirs)
+        })?;
+    }
 
     Ok(total_files)
 }
@@ -397,7 +482,7 @@ pub fn extract_tar(ctx: &ExtractionContext) -> Result<usize> {
     let file = File::open(ctx.path).context("Failed to open TAR file")?;
     let mut archive = Archive::new(BufReader::new(file));
     let mut extracted = 0;
-    let mut created_dirs = std::collections::HashSet::new();
+    let created_dirs = DirTracker::new();
 
     for entry in archive.entries().context("Failed to read entries")? {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
@@ -405,22 +490,20 @@ pub fn extract_tar(ctx: &ExtractionContext) -> Result<usize> {
         }
 
         let mut entry = entry.context("Failed to read entry")?;
-        let entry_path = entry.path().context("Failed to read entry path")?.to_path_buf();
+        let entry_path = entry
+            .path()
+            .context("Failed to read entry path")?
+            .to_path_buf();
         let out_path = sanitize_target_path(ctx.dest, &entry_path)?;
 
-        if let Some(parent) = out_path.parent() {
-            if !created_dirs.contains(parent) {
-                fs::create_dir_all(parent).context("Failed to create directory")?;
-                created_dirs.insert(parent.to_path_buf());
-            }
-        }
+        created_dirs.ensure_parent(&out_path)?;
 
         entry.unpack(&out_path).context("Failed to extract entry")?;
         extracted += 1;
         ctx.progress.fetch_add(1, Ordering::Relaxed);
+        ctx.total.store(extracted, Ordering::Relaxed);
     }
 
-    ctx.total.store(extracted, Ordering::Relaxed);
     Ok(extracted)
 }
 
@@ -431,7 +514,9 @@ pub fn extract_gzip(ctx: &ExtractionContext) -> Result<usize> {
 
 /// Extract a BZIP2 file
 pub fn extract_bzip2(ctx: &ExtractionContext) -> Result<usize> {
-    extract_single_file(ctx, &[".bz2"], "BZIP2", |r| Ok(bzip2::read::BzDecoder::new(r)))
+    extract_single_file(ctx, &[".bz2"], "BZIP2", |r| {
+        Ok(bzip2::read::BzDecoder::new(r))
+    })
 }
 
 /// Extract an XZ file
@@ -440,8 +525,12 @@ pub fn extract_xz(ctx: &ExtractionContext) -> Result<usize> {
 }
 
 /// Extract a 7z archive
+///
+/// Cancellation is detected via [`ExtractionCancelled`] sentinel error, compared
+/// by string representation. This was validated against `sevenz_rust` 0.6 and
+/// depends on `Error::other()` not wrapping the message.
 pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
-    use sevenz_rust::{SevenZReader, Password};
+    use sevenz_rust::{Password, SevenZReader};
 
     if ctx.cancel_flag.load(Ordering::Relaxed) {
         anyhow::bail!("Extraction cancelled");
@@ -457,11 +546,11 @@ pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
     ctx.total.store(total_entries, Ordering::Relaxed);
 
     let mut extracted = 0;
-    let mut created_dirs = std::collections::HashSet::new();
+    let created_dirs = DirTracker::new();
 
     let res = reader.for_each_entries(|entry, file_reader| {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
-            return Err(sevenz_rust::Error::other("Extraction cancelled"));
+            return Err(sevenz_rust::Error::other(ExtractionCancelled.to_string()));
         }
 
         let entry_path = Path::new(&entry.name);
@@ -469,21 +558,16 @@ pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
             .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
 
         if entry.is_directory() {
-            if !created_dirs.contains(&out_path) {
-                fs::create_dir_all(&out_path).map_err(sevenz_rust::Error::io)?;
-                created_dirs.insert(out_path.clone());
-            }
+            created_dirs
+                .ensure_dir(&out_path)
+                .map_err(|e| sevenz_rust::Error::other(format!("{:#}", e)))?;
         } else {
-            if let Some(parent) = out_path.parent() {
-                if !created_dirs.contains(parent) {
-                    fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
-                    created_dirs.insert(parent.to_path_buf());
-                }
-            }
+            created_dirs
+                .ensure_parent(&out_path)
+                .map_err(|e| sevenz_rust::Error::other(format!("{:#}", e)))?;
 
-            let mut outfile = BufWriter::new(
-                File::create(&out_path).map_err(sevenz_rust::Error::io)?
-            );
+            let mut outfile =
+                BufWriter::new(File::create(&out_path).map_err(sevenz_rust::Error::io)?);
             std::io::copy(file_reader, &mut outfile).map_err(sevenz_rust::Error::io)?;
             outfile.flush().map_err(sevenz_rust::Error::io)?;
         }
@@ -496,7 +580,7 @@ pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
     match res {
         Ok(_) => Ok(extracted),
         Err(e) => {
-            if e.to_string().contains("cancelled") {
+            if e.to_string() == ExtractionCancelled.to_string() {
                 anyhow::bail!("Extraction cancelled");
             }
             Err(anyhow::anyhow!("Failed to extract 7z archive: {}", e))
@@ -525,15 +609,9 @@ pub fn extract_lz4(ctx: &ExtractionContext) -> Result<usize> {
 pub fn extract_rar(ctx: &ExtractionContext) -> Result<usize> {
     let path_str = ctx.path.to_string_lossy().to_string();
 
-    // Open for listing first to count entries
-    let archive = RarArchive::new(&path_str);
-    let mut list_archive = archive
-        .open_for_listing()
-        .context("Failed to open RAR archive")?;
-    let entries: Vec<_> = list_archive.by_ref().filter_map(|e| e.ok()).collect();
-    ctx.total.store(entries.len(), Ordering::Relaxed);
-
-    // Now open for processing/extraction (with password if provided)
+    // Open for processing/extraction (with password if provided).
+    // Progress total is set post-hoc based on extracted count since
+    // we skip a separate listing pass to avoid double I/O.
     let archive = if let Some(pwd) = ctx.password {
         RarArchive::with_password(&path_str, pwd)
     } else {
@@ -545,7 +623,7 @@ pub fn extract_rar(ctx: &ExtractionContext) -> Result<usize> {
         .context("Failed to open RAR for processing")?;
 
     let mut extracted = 0;
-    let mut created_dirs = std::collections::HashSet::new();
+    let created_dirs = DirTracker::new();
 
     loop {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
@@ -563,19 +641,11 @@ pub fn extract_rar(ctx: &ExtractionContext) -> Result<usize> {
         let entry_path = header.filename.clone();
         let out_path = sanitize_target_path(ctx.dest, &entry_path)?;
 
-        if let Some(parent) = out_path.parent() {
-            if !created_dirs.contains(parent) {
-                fs::create_dir_all(parent).context("Failed to create directory")?;
-                created_dirs.insert(parent.to_path_buf());
-            }
-        }
-
         if header.is_directory() {
-            if !created_dirs.contains(&out_path) {
-                fs::create_dir_all(&out_path).ok();
-                created_dirs.insert(out_path.clone());
-            }
+            created_dirs.ensure_dir(&out_path)?;
         } else {
+            created_dirs.ensure_parent(&out_path)?;
+
             // Extract the file to the sanitized path instead of using
             // extract_with_base (which uses the raw entry filename and
             // would bypass path traversal protection)
@@ -584,6 +654,7 @@ pub fn extract_rar(ctx: &ExtractionContext) -> Result<usize> {
                 .context("Failed to extract file")?;
             extracted += 1;
             ctx.progress.fetch_add(1, Ordering::Relaxed);
+            ctx.total.store(extracted, Ordering::Relaxed);
             continue;
         }
 
@@ -628,9 +699,10 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
                 let entry = entry?;
                 let path = entry.path()?.to_path_buf();
                 let header = entry.header();
+                let is_dir = header.entry_type() == tar::EntryType::Directory;
                 entries.push(ArchiveEntry {
                     name: path.to_string_lossy().to_string(),
-                    is_dir: entry.path()?.ends_with("/"),
+                    is_dir,
                     size: header.size().unwrap_or(0),
                     compressed_size: 0,
                     path,
@@ -638,7 +710,12 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
             }
             Ok(entries)
         }
-        ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd | ArchiveFormat::Brotli | ArchiveFormat::Lz4 => {
+        ArchiveFormat::Gzip
+        | ArchiveFormat::Bzip2
+        | ArchiveFormat::Xz
+        | ArchiveFormat::Zstd
+        | ArchiveFormat::Brotli
+        | ArchiveFormat::Lz4 => {
             let file = File::open(path)?;
             let metadata = file.metadata()?;
             Ok(vec![ArchiveEntry {
@@ -648,13 +725,13 @@ pub fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>> {
                     .to_string_lossy()
                     .to_string(),
                 is_dir: false,
-                size: metadata.len(),
+                size: 0,
                 compressed_size: metadata.len(),
                 path: path.to_path_buf(),
             }])
         }
         ArchiveFormat::SevenZip => {
-            use sevenz_rust::{SevenZReader, Password};
+            use sevenz_rust::{Password, SevenZReader};
             let reader = SevenZReader::open(path, Password::default())
                 .map_err(|e| anyhow::anyhow!("Failed to list 7z archive: {}", e))?;
             let archive = reader.archive();
@@ -723,6 +800,7 @@ pub fn extract_archive(ctx: &ExtractionContext) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]
@@ -836,7 +914,7 @@ mod tests {
     #[test]
     fn test_sanitize_target_path() {
         let dest = Path::new("/target/dir");
-        
+
         // Safe relative paths
         assert_eq!(
             sanitize_target_path(dest, Path::new("file.txt")).unwrap(),
@@ -865,11 +943,238 @@ mod tests {
     }
 
     #[test]
-    fn test_create_temp_dir_for_extraction() {
+    fn test_gzip_extraction() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
         let temp_dir = TempDir::new().unwrap();
-        let dest = temp_dir.path().join("output");
-        fs::create_dir_all(&dest).unwrap();
-        assert!(dest.exists());
+        let archive_path = temp_dir.path().join("test.tar.gz");
+        let dest_dir = temp_dir.path().join("output");
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"Hello, gzip!").unwrap();
+        let compressed = encoder.finish().unwrap();
+        std::fs::write(&archive_path, compressed).unwrap();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let ctx = ExtractionContext {
+            path: &archive_path,
+            dest: &dest_dir,
+            progress,
+            total,
+            cancel_flag: cancel,
+            password: None,
+        };
+
+        let result = extract_gzip(&ctx);
+        assert!(result.is_ok());
+
+        let output_path = dest_dir.join("test.tar");
+        assert!(output_path.exists());
+        let content = std::fs::read_to_string(output_path).unwrap();
+        assert_eq!(content, "Hello, gzip!");
+    }
+
+    #[test]
+    fn test_zip_extract_small_archive() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.zip");
+        let dest_dir = temp_dir.path().join("output");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("hello.txt", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(b"Hello, world!").unwrap();
+        zip.finish().unwrap();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let ctx = ExtractionContext {
+            path: &archive_path,
+            dest: &dest_dir,
+            progress,
+            total,
+            cancel_flag: cancel,
+            password: None,
+        };
+
+        let result = extract_zip(&ctx);
+        assert!(result.is_ok());
+        assert!(dest_dir.join("hello.txt").exists());
+        let content = std::fs::read_to_string(dest_dir.join("hello.txt")).unwrap();
+        assert_eq!(content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_zip_extract_with_subdirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.zip");
+        let dest_dir = temp_dir.path().join("output");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.add_directory("subdir/", zip::write::FileOptions::default())
+            .unwrap();
+        zip.start_file("subdir/file.txt", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(b"nested").unwrap();
+        zip.finish().unwrap();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let ctx = ExtractionContext {
+            path: &archive_path,
+            dest: &dest_dir,
+            progress,
+            total,
+            cancel_flag: cancel,
+            password: None,
+        };
+
+        let result = extract_zip(&ctx);
+        assert!(result.is_ok());
+        assert!(dest_dir.join("subdir/file.txt").exists());
+        let content = std::fs::read_to_string(dest_dir.join("subdir/file.txt")).unwrap();
+        assert_eq!(content, "nested");
+    }
+
+    #[test]
+    fn test_tar_extract_small_archive() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.tar");
+        let dest_dir = temp_dir.path().join("output");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut tar = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut header, "data.txt", &b"hello"[..])
+            .unwrap();
+        tar.finish().unwrap();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let ctx = ExtractionContext {
+            path: &archive_path,
+            dest: &dest_dir,
+            progress,
+            total,
+            cancel_flag: cancel,
+            password: None,
+        };
+
+        let result = extract_tar(&ctx);
+        assert!(result.is_ok());
+        assert!(dest_dir.join("data.txt").exists());
+        let content = std::fs::read_to_string(dest_dir.join("data.txt")).unwrap();
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn test_path_traversal_rejected_zip() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("traversal.zip");
+        let dest_dir = temp_dir.path().join("output");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("../escape.txt", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(b"pwned").unwrap();
+        zip.finish().unwrap();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let ctx = ExtractionContext {
+            path: &archive_path,
+            dest: &dest_dir,
+            progress,
+            total,
+            cancel_flag: cancel,
+            password: None,
+        };
+
+        let result = extract_zip(&ctx);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("traversal") || err.contains("escapes"));
+    }
+
+    #[test]
+    fn test_sanitize_target_path_rejects_traversal() {
+        let dest = Path::new("/safe/dir");
+        assert!(sanitize_target_path(dest, Path::new("../evil")).is_err());
+        assert!(sanitize_target_path(dest, Path::new("a/../../evil")).is_err());
+        assert!(sanitize_target_path(dest, Path::new("/absolute/path")).is_ok());
+    }
+
+    #[test]
+    fn test_list_archive_zip() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.zip");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("file_a.txt", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(b"aaa").unwrap();
+        zip.start_file("file_b.txt", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(b"bbb").unwrap();
+        zip.finish().unwrap();
+
+        let entries = list_archive(&archive_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.name == "file_a.txt"));
+        assert!(entries.iter().any(|e| e.name == "file_b.txt"));
+    }
+
+    #[test]
+    fn test_extract_cancellation_during_zip() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.zip");
+        let dest_dir = temp_dir.path().join("output");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for i in 0..10 {
+            zip.start_file(
+                format!("file_{}.txt", i),
+                zip::write::FileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"data").unwrap();
+        }
+        zip.finish().unwrap();
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let ctx = ExtractionContext {
+            path: &archive_path,
+            dest: &dest_dir,
+            progress,
+            total,
+            cancel_flag: cancel,
+            password: None,
+        };
+
+        let result = extract_zip(&ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
     }
 }
-

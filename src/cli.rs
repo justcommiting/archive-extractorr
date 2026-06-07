@@ -206,11 +206,13 @@ fn run_info(archive: &Path, verbose: bool) -> anyhow::Result<()> {
     println!("Total size: {}", format_size(total_size));
 
     // Check for encryption
-    if format == ArchiveFormat::Zip && extractor::is_zip_encrypted(archive) {
-        println!("Encrypted: Yes");
-    } else {
-        println!("Encrypted: No");
-    }
+    let encrypted = match format {
+        ArchiveFormat::Zip => extractor::is_zip_encrypted(archive),
+        ArchiveFormat::Rar => extractor::is_rar_encrypted(archive),
+        ArchiveFormat::SevenZip => extractor::is_sevenzip_encrypted(archive),
+        _ => false,
+    };
+    println!("Encrypted: {}", if encrypted { "Yes" } else { "No" });
 
     if verbose && !entries.is_empty() {
         println!("\nContents:");
@@ -223,4 +225,3 @@ fn run_info(archive: &Path, verbose: bool) -> anyhow::Result<()> {
 
     Ok(())
 }
-

@@ -4,9 +4,41 @@ use crate::ui::theme::Theme;
 use eframe::egui;
 use log::{error, info};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+#[cfg(feature = "gui")]
+fn pick_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Archive", formats::supported_extensions())
+        .pick_file()
+}
+
+#[cfg(not(feature = "gui"))]
+fn pick_file() -> Option<PathBuf> {
+    log::warn!("File dialog unavailable (GUI feature disabled)");
+    None
+}
+
+#[cfg(feature = "gui")]
+fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+
+#[cfg(not(feature = "gui"))]
+fn pick_folder() -> Option<PathBuf> {
+    log::warn!("File dialog unavailable (GUI feature disabled)");
+    None
+}
+
+#[cfg(feature = "gui")]
+fn open_path(path: &Path) {
+    let _ = open::that(path);
+}
+
+#[cfg(not(feature = "gui"))]
+fn open_path(_path: &Path) {}
 
 /// Result of loading an archive in a background thread
 /// (encryption check + entry listing, off the UI thread).
@@ -15,17 +47,20 @@ struct LoadedArchive {
     entries: Vec<ArchiveEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub enum SortBy {
+    #[default]
     Name,
     Size,
     Type,
 }
 
-impl Default for SortBy {
-    fn default() -> Self {
-        Self::Name
-    }
+/// Precomputed sort keys to avoid per-comparison heap allocations when sorting archive entries.
+struct SortKey {
+    name_lower: String,
+    ext_lower: String,
+    size: u64,
+    is_dir: bool,
 }
 
 /// Application state
@@ -51,7 +86,8 @@ pub struct ArchiveExtractorApp {
     show_password: bool,
     request_password_focus: bool,
     error_message: Arc<Mutex<Option<String>>>,
-    filtered_entries: Vec<ArchiveEntry>,
+    sort_keys: Vec<SortKey>,
+    sorted_indices: Vec<usize>,
 
     // Sorting state
     sort_by: SortBy,
@@ -66,6 +102,10 @@ pub struct ArchiveExtractorApp {
     is_loading: bool,
     loading_handle: Option<thread::JoinHandle<()>>,
     loading_result: Arc<Mutex<Option<anyhow::Result<LoadedArchive>>>>,
+
+    // Generation counters for stale thread detection
+    load_generation: Arc<AtomicU64>,
+    extract_generation: Arc<AtomicU64>,
 }
 
 impl Default for ArchiveExtractorApp {
@@ -92,7 +132,8 @@ impl Default for ArchiveExtractorApp {
             show_password: false,
             request_password_focus: false,
             error_message: Arc::new(Mutex::new(None)),
-            filtered_entries: Vec::new(),
+            sort_keys: Vec::new(),
+            sorted_indices: Vec::new(),
             sort_by: SortBy::Name,
             sort_ascending: true,
             extraction_start_time: None,
@@ -101,6 +142,8 @@ impl Default for ArchiveExtractorApp {
             is_loading: false,
             loading_handle: None,
             loading_result: Arc::new(Mutex::new(None)),
+            load_generation: Arc::new(AtomicU64::new(0)),
+            extract_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -113,32 +156,39 @@ impl ArchiveExtractorApp {
     fn set_archive(&mut self, path: PathBuf) {
         info!("Opening archive: {:?}", path);
 
-        // Synchronous state reset (fast, on UI thread)
-        self.archive_path = Some(path.clone());
-        self.archive_format = ArchiveFormat::detect(&path);
+        // Extract what we need from the owned path before moving it into self.
+        let format = ArchiveFormat::detect(&path);
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+        // Set default destination (reads self.archive_format, so set it first)
+        self.archive_format = format;
+        self.set_default_destination(&path);
+
+        // Move path into self — saves 1 heap-allocated clone vs the original
+        self.archive_path = Some(path);
         self.archive_entries.clear();
-        self.filtered_entries.clear();
+        self.sorted_indices.clear();
+        self.extraction_start_time = None;
         self.extraction_progress = 0.0;
         self.password.clear();
         self.password_error = false;
         self.is_encrypted = false;
         self.request_password_focus = false;
 
-        // Set default destination
-        self.set_default_destination(&path);
-
-        match self.archive_format {
+        match format {
             Some(format) => {
                 self.status_message = format!(
                     "Loading {} · {} …",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    file_name,
                     formats::format_name(format)
                 );
 
                 // Spawn a background thread for encryption check + listing
                 // so the UI stays responsive during I/O.
-                let path_clone = path.clone();
+                let path_clone = self.archive_path.as_ref().unwrap().clone();
                 let result = Arc::clone(&self.loading_result);
+                let gen = self.load_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                let gen_arc = Arc::clone(&self.load_generation);
                 self.is_loading = true;
                 self.loading_handle = Some(thread::spawn(move || {
                     let is_encrypted = match format {
@@ -174,11 +224,13 @@ impl ArchiveExtractorApp {
                         }
                     };
 
-                    *result.lock().unwrap() = Some(outcome);
+                    if gen_arc.load(Ordering::Relaxed) == gen {
+                        *result.lock().unwrap() = Some(outcome);
+                    }
                 }));
             }
             None => {
-                self.status_message = format!("Unknown format: {}", path.display());
+                self.status_message = format!("Unknown format: {}", file_name);
             }
         }
     }
@@ -206,42 +258,60 @@ impl ArchiveExtractorApp {
         self.archive_entries.iter().map(|e| e.size).sum()
     }
 
-    fn update_filtered_entries(&mut self) {
-        let mut entries: Vec<ArchiveEntry> = if self.search_query.is_empty() {
-            self.archive_entries.clone()
+    fn rebuild_sort_keys(&mut self) {
+        self.sort_keys = self
+            .archive_entries
+            .iter()
+            .map(|e| SortKey {
+                name_lower: e.name.to_lowercase(),
+                ext_lower: e
+                    .path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase(),
+                size: e.size,
+                is_dir: e.is_dir,
+            })
+            .collect();
+    }
+
+    fn filter_entries(&mut self) {
+        if self.search_query.is_empty() {
+            self.sorted_indices = (0..self.archive_entries.len()).collect();
         } else {
             let search_lower = self.search_query.to_lowercase();
-            self.archive_entries
-                .iter()
-                .filter(|e| e.name.to_lowercase().contains(&search_lower))
-                .cloned()
-                .collect()
-        };
+            self.sorted_indices.retain(|&i| {
+                self.sort_keys[i].name_lower.contains(&search_lower)
+            });
+        }
+    }
 
-        entries.sort_by(|a, b| {
-            let ord = match self.sort_by {
-                SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                SortBy::Size => a.size.cmp(&b.size),
+    fn sort_entries(&mut self) {
+        self.sorted_indices = (0..self.archive_entries.len()).collect();
+        let sort_keys = &self.sort_keys;
+        let sort_by = self.sort_by;
+        let sort_ascending = self.sort_ascending;
+        self.sorted_indices.sort_by(|&a, &b| {
+            let ka = &sort_keys[a];
+            let kb = &sort_keys[b];
+            let ord = match sort_by {
+                SortBy::Name => ka.name_lower.cmp(&kb.name_lower),
+                SortBy::Size => ka.size.cmp(&kb.size),
                 SortBy::Type => {
-                    let a_dir = a.is_dir;
-                    let b_dir = b.is_dir;
-                    if a_dir != b_dir {
-                        b_dir.cmp(&a_dir)
+                    if ka.is_dir != kb.is_dir {
+                        kb.is_dir.cmp(&ka.is_dir)
                     } else {
-                        let ext_a = a.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                        let ext_b = b.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                        ext_a.cmp(&ext_b)
+                        ka.ext_lower.cmp(&kb.ext_lower)
                     }
                 }
             };
-            if self.sort_ascending {
+            if sort_ascending {
                 ord
             } else {
                 ord.reverse()
             }
         });
-
-        self.filtered_entries = entries;
     }
 
     fn start_extraction(&mut self) {
@@ -280,6 +350,9 @@ impl ArchiveExtractorApp {
 
         info!("Starting extraction to {:?}", dest_path);
 
+        let gen = self.extract_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let gen_arc = Arc::clone(&self.extract_generation);
+
         let handle = thread::spawn(move || {
             let ctx = extractor::ExtractionContext {
                 path: &archive_path,
@@ -293,7 +366,9 @@ impl ArchiveExtractorApp {
             if let Err(e) = result {
                 let err_str = format!("{:#}", e);
                 error!("Extraction failed: {}", err_str);
-                *error_message.lock().unwrap() = Some(err_str);
+                if gen_arc.load(Ordering::Relaxed) == gen {
+                    *error_message.lock().unwrap() = Some(err_str);
+                }
             }
         });
 
@@ -310,7 +385,7 @@ impl ArchiveExtractorApp {
 
         if total > 0 {
             self.extraction_progress = (current as f32 / total as f32) * 100.0;
-            if self.archive_format.map_or(false, |f| f.is_single_file()) {
+            if self.archive_format.is_some_and(|f| f.is_single_file()) {
                 self.extraction_status = format!(
                     "{} / {}",
                     formats::format_size(current as u64),
@@ -325,7 +400,7 @@ impl ArchiveExtractorApp {
             let elapsed = start_time.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
             self.extraction_elapsed = format!("{:.1}s", elapsed_secs);
-            
+
             if elapsed_secs > 0.1 && current > 0 {
                 let speed = current as f64 / elapsed_secs;
                 self.extraction_speed = format!("{:.1} files/s", speed);
@@ -338,7 +413,7 @@ impl ArchiveExtractorApp {
                 self.extraction_handle = None;
 
                 let total_time_str = if let Some(start_time) = self.extraction_start_time {
-                    format!(" in {:.2}s", start_time.elapsed().as_secs_f32())
+                    format!(" in {:.2}s", start_time.elapsed().as_secs_f64())
                 } else {
                     String::new()
                 };
@@ -396,11 +471,11 @@ impl ArchiveExtractorApp {
             Some(Ok(loaded)) => {
                 self.is_encrypted = loaded.is_encrypted;
                 self.archive_entries = loaded.entries;
-                self.update_filtered_entries();
+                self.rebuild_sort_keys();
+                self.sort_entries();
 
                 if self.archive_entries.is_empty() && !self.is_encrypted {
-                    self.status_message =
-                        String::from("No files found in archive");
+                    self.status_message = String::from("No files found in archive");
                 } else if self.is_encrypted {
                     self.request_password_focus = true;
                     self.status_message = if self.archive_entries.is_empty() {
@@ -431,8 +506,7 @@ impl ArchiveExtractorApp {
                 {
                     self.is_encrypted = true;
                     self.request_password_focus = true;
-                    self.status_message =
-                        String::from("Archive is password protected");
+                    self.status_message = String::from("Archive is password protected");
                 } else {
                     self.status_message = format!("Error: {}", err_text);
                 }
@@ -530,18 +604,19 @@ impl ArchiveExtractorApp {
                             let text_edit = egui::TextEdit::singleline(&mut self.destination_edit)
                                 .desired_width(250.0)
                                 .font(egui::TextStyle::Monospace);
-                            ui.add(text_edit);
+                            let response = ui.add(text_edit);
+
+                            if response.changed() {
+                                self.destination_path = Some(PathBuf::from(&self.destination_edit));
+                            }
 
                             if ui.button("Browse").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                if let Some(path) = pick_folder() {
                                     self.destination_path = Some(path.clone());
                                     self.destination_edit = path.display().to_string();
                                 }
                             }
                         });
-
-                        // Update destination when text changes
-                        self.destination_path = Some(PathBuf::from(&self.destination_edit));
                     });
                 }
             });
@@ -572,12 +647,12 @@ impl ArchiveExtractorApp {
                     };
 
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("[LOCKED] ").size(13.0).color(pass_color));
                         ui.label(
-                            egui::RichText::new(pass_label)
+                            egui::RichText::new("[LOCKED] ")
                                 .size(13.0)
                                 .color(pass_color),
                         );
+                        ui.label(egui::RichText::new(pass_label).size(13.0).color(pass_color));
                     });
 
                     ui.add_space(6.0);
@@ -621,13 +696,14 @@ impl ArchiveExtractorApp {
                         } else {
                             "Show password"
                         };
-                        if ui.add(
-                            egui::Button::new(toggle_label)
-                                .min_size(egui::vec2(60.0, 24.0))
-                                .rounding(egui::Rounding::same(4.0)),
-                        )
-                        .on_hover_text(toggle_tip)
-                        .clicked()
+                        if ui
+                            .add(
+                                egui::Button::new(toggle_label)
+                                    .min_size(egui::vec2(60.0, 24.0))
+                                    .rounding(egui::Rounding::same(4.0)),
+                            )
+                            .on_hover_text(toggle_tip)
+                            .clicked()
                         {
                             self.show_password = !self.show_password;
                         }
@@ -647,7 +723,10 @@ impl ArchiveExtractorApp {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     ui.available_size()
-                                        - egui::vec2(if self.is_extracting { 90.0 } else { 0.0 }, 0.0),
+                                        - egui::vec2(
+                                            if self.is_extracting { 90.0 } else { 0.0 },
+                                            0.0,
+                                        ),
                                     egui::ProgressBar::new(self.extraction_progress / 100.0)
                                         .desired_width(ui.available_size().x)
                                         .show_percentage()
@@ -656,13 +735,14 @@ impl ArchiveExtractorApp {
                                 );
 
                                 if self.is_extracting
-                                    && ui.add(
-                                        egui::Button::new("Cancel")
-                                            .min_size(egui::vec2(80.0, 24.0))
-                                            .rounding(egui::Rounding::same(4.0)),
-                                    )
-                                    .on_hover_text("Esc")
-                                    .clicked()
+                                    && ui
+                                        .add(
+                                            egui::Button::new("Cancel")
+                                                .min_size(egui::vec2(80.0, 24.0))
+                                                .rounding(egui::Rounding::same(4.0)),
+                                        )
+                                        .on_hover_text("Esc")
+                                        .clicked()
                                 {
                                     self.cancel_flag.store(true, Ordering::Relaxed);
                                 }
@@ -671,12 +751,24 @@ impl ArchiveExtractorApp {
                             if self.is_extracting {
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(format!("Elapsed: {}", self.extraction_elapsed))
-                                        .size(11.0).color(egui::Color32::GRAY));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Elapsed: {}",
+                                            self.extraction_elapsed
+                                        ))
+                                        .size(11.0)
+                                        .color(egui::Color32::GRAY),
+                                    );
                                     ui.add_space(16.0);
                                     if !self.extraction_speed.is_empty() {
-                                        ui.label(egui::RichText::new(format!("Speed: {}", self.extraction_speed))
-                                            .size(11.0).color(egui::Color32::GRAY));
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Speed: {}",
+                                                self.extraction_speed
+                                            ))
+                                            .size(11.0)
+                                            .color(egui::Color32::GRAY),
+                                        );
                                     }
                                 });
                             }
@@ -690,49 +782,46 @@ impl ArchiveExtractorApp {
             // Action buttons
             ui.horizontal(|ui| {
                 if self.archive_path.is_none() {
-                    if ui.add(
-                        egui::Button::new("Open Archive")
-                            .min_size(egui::vec2(130.0, 32.0))
-                            .rounding(egui::Rounding::same(6.0)),
-                    )
-                    .on_hover_text("Ctrl+O")
-                    .clicked()
+                    if ui
+                        .add(
+                            egui::Button::new("Open Archive")
+                                .min_size(egui::vec2(130.0, 32.0))
+                                .rounding(egui::Rounding::same(6.0)),
+                        )
+                        .on_hover_text("Ctrl+O")
+                        .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Archive", formats::supported_extensions())
-                            .pick_file()
-                        {
+                        if let Some(path) = pick_file() {
                             self.set_archive(path);
                         }
                     }
                 } else if !self.is_extracting && self.extraction_progress < 100.0 {
-                    if ui.add(
-                        egui::Button::new("Change Archive")
-                            .min_size(egui::vec2(130.0, 32.0))
-                            .rounding(egui::Rounding::same(6.0)),
-                    )
-                    .on_hover_text("Ctrl+O")
-                    .clicked()
+                    if ui
+                        .add(
+                            egui::Button::new("Change Archive")
+                                .min_size(egui::vec2(130.0, 32.0))
+                                .rounding(egui::Rounding::same(6.0)),
+                        )
+                        .on_hover_text("Ctrl+O")
+                        .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Archive", formats::supported_extensions())
-                            .pick_file()
-                        {
+                        if let Some(path) = pick_file() {
                             self.set_archive(path);
                         }
                     }
 
                     ui.add_space(8.0);
 
-                    if ui.add(
-                        egui::Button::new("Destination")
-                            .min_size(egui::vec2(110.0, 32.0))
-                            .rounding(egui::Rounding::same(6.0)),
-                    )
-                    .on_hover_text("Ctrl+D")
-                    .clicked()
+                    if ui
+                        .add(
+                            egui::Button::new("Destination")
+                                .min_size(egui::vec2(110.0, 32.0))
+                                .rounding(egui::Rounding::same(6.0)),
+                        )
+                        .on_hover_text("Ctrl+D")
+                        .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(path) = pick_folder() {
                             self.destination_path = Some(path.clone());
                             self.destination_edit = path.display().to_string();
                         }
@@ -758,7 +847,8 @@ impl ArchiveExtractorApp {
                             egui::Color32::from_rgb(60, 140, 80)
                         });
 
-                        if ui.add(btn)
+                        if ui
+                            .add(btn)
                             .on_hover_text(if needs_password {
                                 "Enter password first"
                             } else {
@@ -771,17 +861,15 @@ impl ArchiveExtractorApp {
                         }
                     });
                 } else if self.extraction_progress >= 100.0 {
-                    if ui.add(
-                        egui::Button::new("Open Another")
-                            .min_size(egui::vec2(130.0, 32.0))
-                            .rounding(egui::Rounding::same(6.0)),
-                    )
-                    .clicked()
+                    if ui
+                        .add(
+                            egui::Button::new("Open Another")
+                                .min_size(egui::vec2(130.0, 32.0))
+                                .rounding(egui::Rounding::same(6.0)),
+                        )
+                        .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Archive", formats::supported_extensions())
-                            .pick_file()
-                        {
+                        if let Some(path) = pick_file() {
                             self.set_archive(path);
                         }
                     }
@@ -789,14 +877,15 @@ impl ArchiveExtractorApp {
                     ui.add_space(8.0);
 
                     if let Some(ref dest) = self.destination_path {
-                        if ui.add(
-                            egui::Button::new("Open Destination")
-                                .min_size(egui::vec2(140.0, 32.0))
-                                .rounding(egui::Rounding::same(6.0)),
-                        )
-                        .clicked()
+                        if ui
+                            .add(
+                                egui::Button::new("Open Destination")
+                                    .min_size(egui::vec2(140.0, 32.0))
+                                    .rounding(egui::Rounding::same(6.0)),
+                            )
+                            .clicked()
                         {
-                            let _ = open::that(dest);
+                            open_path(dest);
                         }
                     }
                 }
@@ -822,7 +911,7 @@ impl ArchiveExtractorApp {
                     let showing = if self.search_query.is_empty() {
                         format!("Contents  ·  {} files ", total)
                     } else {
-                        let count = self.filtered_entries.len();
+                        let count = self.sorted_indices.len();
                         format!("Contents  ·  {} / {} files ", count, total)
                     };
                     ui.label(
@@ -838,19 +927,20 @@ impl ArchiveExtractorApp {
                                 .desired_width(200.0),
                         );
                         if search_resp.changed() {
-                            self.update_filtered_entries();
+                            self.filter_entries();
                         }
 
                         if !self.search_query.is_empty()
-                            && ui.add(
-                                egui::Button::new("X")
-                                    .min_size(egui::vec2(20.0, 20.0))
-                                    .rounding(egui::Rounding::same(4.0)),
-                            )
-                            .clicked()
+                            && ui
+                                .add(
+                                    egui::Button::new("X")
+                                        .min_size(egui::vec2(20.0, 20.0))
+                                        .rounding(egui::Rounding::same(4.0)),
+                                )
+                                .clicked()
                         {
                             self.search_query.clear();
-                            self.update_filtered_entries();
+                            self.filter_entries();
                         }
                     });
                 });
@@ -866,13 +956,22 @@ impl ArchiveExtractorApp {
                     );
 
                     let mut sort_clicked = None;
-                    if ui.selectable_label(self.sort_by == SortBy::Name, "Name").clicked() {
+                    if ui
+                        .selectable_label(self.sort_by == SortBy::Name, "Name")
+                        .clicked()
+                    {
                         sort_clicked = Some(SortBy::Name);
                     }
-                    if ui.selectable_label(self.sort_by == SortBy::Size, "Size").clicked() {
+                    if ui
+                        .selectable_label(self.sort_by == SortBy::Size, "Size")
+                        .clicked()
+                    {
                         sort_clicked = Some(SortBy::Size);
                     }
-                    if ui.selectable_label(self.sort_by == SortBy::Type, "Type").clicked() {
+                    if ui
+                        .selectable_label(self.sort_by == SortBy::Type, "Type")
+                        .clicked()
+                    {
                         sort_clicked = Some(SortBy::Type);
                     }
 
@@ -883,10 +982,14 @@ impl ArchiveExtractorApp {
                             self.sort_by = clicked_sort;
                             self.sort_ascending = true;
                         }
-                        self.update_filtered_entries();
+                        self.sort_entries();
                     }
 
-                    let arrow = if self.sort_ascending { "(asc)" } else { "(desc)" };
+                    let arrow = if self.sort_ascending {
+                        "(asc)"
+                    } else {
+                        "(desc)"
+                    };
                     ui.label(
                         egui::RichText::new(arrow)
                             .size(11.0)
@@ -900,9 +1003,7 @@ impl ArchiveExtractorApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        let filtered = &self.filtered_entries;
-
-                        if filtered.is_empty() {
+                        if self.sorted_indices.is_empty() {
                             ui.add_space(20.0);
                             ui.horizontal(|ui| {
                                 ui.add_space(10.0);
@@ -914,7 +1015,8 @@ impl ArchiveExtractorApp {
                             });
                             ui.add_space(10.0);
                         } else {
-                            for (idx, entry) in filtered.iter().enumerate() {
+                            for (idx, &entry_idx) in self.sorted_indices.iter().enumerate() {
+                                let entry = &self.archive_entries[entry_idx];
                                 let bg = if idx % 2 == 0 {
                                     egui::Color32::from_rgba_premultiplied(30, 30, 38, 80)
                                 } else {
@@ -928,29 +1030,35 @@ impl ArchiveExtractorApp {
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             ui.label(
-                                                egui::RichText::new(formats::file_icon(entry))
-                                                    .size(14.0),
+                                                egui::RichText::new(formats::entry_type_label(
+                                                    entry,
+                                                ))
+                                                .size(14.0),
                                             );
                                             ui.label(
-                                                egui::RichText::new(&entry.name)
-                                                    .size(13.0)
-                                                    .color(if entry.is_dir {
+                                                egui::RichText::new(&entry.name).size(13.0).color(
+                                                    if entry.is_dir {
                                                         egui::Color32::from_rgb(160, 180, 210)
                                                     } else {
                                                         egui::Color32::WHITE
-                                                    }),
+                                                    },
+                                                ),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
+                                                    let size_text =
+                                                        if entry.size > 0 || entry.is_dir {
+                                                            formats::format_size(entry.size)
+                                                        } else {
+                                                            String::from("?")
+                                                        };
                                                     ui.label(
-                                                        egui::RichText::new(formats::format_size(
-                                                            entry.size,
-                                                        ))
-                                                        .size(11.0)
-                                                        .color(egui::Color32::from_rgb(
-                                                            120, 120, 130,
-                                                        )),
+                                                        egui::RichText::new(size_text)
+                                                            .size(11.0)
+                                                            .color(egui::Color32::from_rgb(
+                                                                120, 120, 130,
+                                                            )),
                                                     );
                                                 },
                                             );
@@ -999,23 +1107,21 @@ impl ArchiveExtractorApp {
 
                         ui.add_space(16.0);
 
-                        if ui.add(
-                            egui::Button::new(
-                                egui::RichText::new("Browse Files")
-                                    .size(14.0)
-                                    .color(egui::Color32::WHITE),
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Browse Files")
+                                        .size(14.0)
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .min_size(egui::vec2(140.0, 36.0))
+                                .rounding(egui::Rounding::same(8.0))
+                                .fill(egui::Color32::from_rgb(60, 100, 160)),
                             )
-                            .min_size(egui::vec2(140.0, 36.0))
-                            .rounding(egui::Rounding::same(8.0))
-                            .fill(egui::Color32::from_rgb(60, 100, 160)),
-                        )
-                        .on_hover_text("Ctrl+O")
-                        .clicked()
+                            .on_hover_text("Ctrl+O")
+                            .clicked()
                         {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Archive", formats::supported_extensions())
-                                .pick_file()
-                            {
+                            if let Some(path) = pick_file() {
                                 self.set_archive(path);
                             }
                         }
@@ -1047,6 +1153,18 @@ impl ArchiveExtractorApp {
     }
 }
 
+impl Drop for ArchiveExtractorApp {
+    fn drop(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.extraction_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.loading_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl eframe::App for ArchiveExtractorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_extraction_status();
@@ -1055,34 +1173,26 @@ impl eframe::App for ArchiveExtractorApp {
             ctx.request_repaint();
         }
 
-        // Keyboard shortcuts
-        let input = ctx.input(|i| i.clone());
-
         // Ctrl/Cmd+O: Open archive
-        if input.key_pressed(egui::Key::O) && (input.modifiers.ctrl || input.modifiers.command) {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Archive", formats::supported_extensions())
-                .pick_file()
-            {
+        if ctx.input(|i| i.key_pressed(egui::Key::O) && (i.modifiers.ctrl || i.modifiers.command)) {
+            if let Some(path) = pick_file() {
                 self.set_archive(path);
             }
         }
 
         // Ctrl/Cmd+D: Select destination
-        if input.key_pressed(egui::Key::D)
-            && (input.modifiers.ctrl || input.modifiers.command)
+        if ctx.input(|i| i.key_pressed(egui::Key::D) && (i.modifiers.ctrl || i.modifiers.command))
             && self.archive_path.is_some()
             && !self.is_extracting
         {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            if let Some(path) = pick_folder() {
                 self.destination_path = Some(path.clone());
                 self.destination_edit = path.display().to_string();
             }
         }
 
         // Ctrl/Cmd+E: Extract
-        if input.key_pressed(egui::Key::E)
-            && (input.modifiers.ctrl || input.modifiers.command)
+        if ctx.input(|i| i.key_pressed(egui::Key::E) && (i.modifiers.ctrl || i.modifiers.command))
             && self.archive_path.is_some()
             && !self.is_extracting
         {
@@ -1090,12 +1200,12 @@ impl eframe::App for ArchiveExtractorApp {
         }
 
         // Ctrl/Cmd+Q: Quit
-        if input.key_pressed(egui::Key::Q) && (input.modifiers.ctrl || input.modifiers.command) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Q) && (i.modifiers.ctrl || i.modifiers.command)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         // Escape: Cancel extraction
-        if input.key_pressed(egui::Key::Escape) && self.is_extracting {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.is_extracting {
             self.cancel_flag.store(true, Ordering::Relaxed);
         }
 

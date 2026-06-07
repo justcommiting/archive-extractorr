@@ -5,8 +5,6 @@ use egui::{Color32, Rounding, Spacing, Stroke, Vec2, Visuals};
 pub enum Theme {
     Dark,
     Light,
-    #[allow(dead_code)]
-    System,
 }
 
 impl Theme {
@@ -14,7 +12,6 @@ impl Theme {
         match self {
             Theme::Dark => apply_dark_theme(ctx),
             Theme::Light => apply_light_theme(ctx),
-            Theme::System => apply_dark_theme(ctx),
         }
     }
 }
@@ -52,8 +49,6 @@ fn apply_dark_theme(ctx: &egui::Context) {
         menu_spacing: 4.0,
         ..Default::default()
     };
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(40, 40, 48);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(55, 55, 65);
     ctx.set_style(style);
 }
 

@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(feature = "gui")]
 mod app;
 mod cli;
 mod extractor;
 mod formats;
+#[cfg(feature = "gui")]
 mod ui;
 
 fn main() {
@@ -68,12 +70,6 @@ fn run_gui() -> eframe::Result<()> {
         "Archive Extractor",
         native_options,
         Box::new(|cc| {
-            // Apply custom style
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            style.spacing.button_padding = egui::Vec2::new(8.0, 4.0);
-            cc.egui_ctx.set_style(style);
-
             // Apply dark theme
             let theme = ui::theme::Theme::Dark;
             theme.apply(&cc.egui_ctx);

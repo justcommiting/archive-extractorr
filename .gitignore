@@ -8,6 +8,7 @@
 # IDE and editors
 .idea/
 .vscode/
+.kilo/
 *.swp
 *.swo
 *~
@@ -50,3 +51,4 @@ tarpaulin-report.html
 
 # Test files
 test_output/
+Cargo.lock

@@ -35,8 +35,8 @@ pub fn format_icon(format: ArchiveFormat) -> &'static str {
     }
 }
 
-/// Get file icon based on entry type (ASCII representation)
-pub fn file_icon(entry: &ArchiveEntry) -> &'static str {
+/// Get a label for the entry type (ASCII representation)
+pub fn entry_type_label(entry: &ArchiveEntry) -> &'static str {
     if entry.is_dir {
         return "[DIR]";
     }
@@ -67,8 +67,8 @@ pub fn is_supported_archive(path: &Path) -> bool {
 /// Get supported extensions
 pub fn supported_extensions() -> &'static [&'static str] {
     &[
-        "zip", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "lzma", "rar",
-        "7z", "7zip", "zst", "zstd", "br", "brotli", "lz4",
+        "zip", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "lzma", "rar", "7z", "7zip", "zst",
+        "zstd", "br", "brotli", "lz4",
     ]
 }
 
@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_icon_directories() {
+    fn test_entry_type_label_directories() {
         let dir_entry = ArchiveEntry {
             name: "folder".to_string(),
             is_dir: true,
@@ -108,11 +108,11 @@ mod tests {
             compressed_size: 0,
             path: Path::new("folder").to_path_buf(),
         };
-        assert_eq!(file_icon(&dir_entry), "[DIR]");
+        assert_eq!(entry_type_label(&dir_entry), "[DIR]");
     }
 
     #[test]
-    fn test_file_icon_extensions() {
+    fn test_entry_type_label_files() {
         let txt_entry = ArchiveEntry {
             name: "file.txt".to_string(),
             is_dir: false,
@@ -120,7 +120,7 @@ mod tests {
             compressed_size: 0,
             path: Path::new("file.txt").to_path_buf(),
         };
-        assert_eq!(file_icon(&txt_entry), "[FILE]");
+        assert_eq!(entry_type_label(&txt_entry), "[FILE]");
 
         let pdf_entry = ArchiveEntry {
             name: "document.pdf".to_string(),
@@ -129,7 +129,7 @@ mod tests {
             compressed_size: 0,
             path: Path::new("document.pdf").to_path_buf(),
         };
-        assert_eq!(file_icon(&pdf_entry), "[FILE]");
+        assert_eq!(entry_type_label(&pdf_entry), "[FILE]");
     }
 
     #[test]
