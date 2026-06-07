@@ -3,10 +3,17 @@ use crate::formats;
 use crate::ui::theme::Theme;
 use eframe::egui;
 use log::{error, info};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Result of loading an archive in a background thread
+/// (encryption check + entry listing, off the UI thread).
+struct LoadedArchive {
+    is_encrypted: bool,
+    entries: Vec<ArchiveEntry>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SortBy {
@@ -42,10 +49,10 @@ pub struct ArchiveExtractorApp {
     password: String,
     password_error: bool,
     show_password: bool,
-    request_password_focus: bool, // <-- ADDED
+    request_password_focus: bool,
     error_message: Arc<Mutex<Option<String>>>,
     filtered_entries: Vec<ArchiveEntry>,
-    
+
     // Sorting state
     sort_by: SortBy,
     sort_ascending: bool,
@@ -54,6 +61,11 @@ pub struct ArchiveExtractorApp {
     extraction_start_time: Option<std::time::Instant>,
     extraction_speed: String,
     extraction_elapsed: String,
+
+    // Background loading: encryption check + listing off the UI thread
+    is_loading: bool,
+    loading_handle: Option<thread::JoinHandle<()>>,
+    loading_result: Arc<Mutex<Option<anyhow::Result<LoadedArchive>>>>,
 }
 
 impl Default for ArchiveExtractorApp {
@@ -86,6 +98,9 @@ impl Default for ArchiveExtractorApp {
             extraction_start_time: None,
             extraction_speed: String::new(),
             extraction_elapsed: String::new(),
+            is_loading: false,
+            loading_handle: None,
+            loading_result: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -98,6 +113,7 @@ impl ArchiveExtractorApp {
     fn set_archive(&mut self, path: PathBuf) {
         info!("Opening archive: {:?}", path);
 
+        // Synchronous state reset (fast, on UI thread)
         self.archive_path = Some(path.clone());
         self.archive_format = ArchiveFormat::detect(&path);
         self.archive_entries.clear();
@@ -106,64 +122,68 @@ impl ArchiveExtractorApp {
         self.password.clear();
         self.password_error = false;
         self.is_encrypted = false;
-        self.request_password_focus = false; // <-- ADDED: Reset focus flag
+        self.request_password_focus = false;
+
+        // Set default destination
+        self.set_default_destination(&path);
 
         match self.archive_format {
             Some(format) => {
-                // Check for encryption
-                self.is_encrypted = match format {
-                    ArchiveFormat::Zip => extractor::is_zip_encrypted(&path),
-                    ArchiveFormat::Rar => extractor::is_rar_encrypted(&path),
-                    ArchiveFormat::SevenZip => extractor::is_sevenzip_encrypted(&path),
-                    _ => false,
-                };
-
                 self.status_message = format!(
-                    "Loaded {} · {} ",
+                    "Loading {} · {} …",
                     path.file_name().unwrap_or_default().to_string_lossy(),
                     formats::format_name(format)
                 );
 
-                if self.is_encrypted {
-                    self.status_message.push_str(" (password protected)");
-                    self.request_password_focus = true; // <-- ADDED: Auto-focus on load
-                }
+                // Spawn a background thread for encryption check + listing
+                // so the UI stays responsive during I/O.
+                let path_clone = path.clone();
+                let result = Arc::clone(&self.loading_result);
+                self.is_loading = true;
+                self.loading_handle = Some(thread::spawn(move || {
+                    let is_encrypted = match format {
+                        ArchiveFormat::Zip => extractor::is_zip_encrypted(&path_clone),
+                        ArchiveFormat::Rar => extractor::is_rar_encrypted(&path_clone),
+                        ArchiveFormat::SevenZip => extractor::is_sevenzip_encrypted(&path_clone),
+                        _ => false,
+                    };
 
-                match extractor::list_archive(&path) {
-                    Ok(entries) => {
-                        self.archive_entries = entries;
-                        self.update_filtered_entries();
-                        self.status_message = format!(
-                            "{} files · {} ",
-                            self.archive_entries.len(),
-                            formats::format_size(self.total_size())
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to list archive entries: {}", e);
-                        let err_text = e.to_string();
-                        let err_lower = err_text.to_lowercase();
-                        let is_password_err = err_lower.contains("password")
-                            || err_lower.contains("decrypt")
-                            || err_lower.contains("badpassword")
-                            || err_lower.contains("passwordrequired");
+                    let list_result = extractor::list_archive(&path_clone);
+                    let outcome = match list_result {
+                        Ok(entries) => Ok(LoadedArchive {
+                            is_encrypted,
+                            entries,
+                        }),
+                        Err(e) => {
+                            let err_text = e.to_string();
+                            let err_lower = err_text.to_lowercase();
+                            let is_password_err = err_lower.contains("password")
+                                || err_lower.contains("decrypt")
+                                || err_lower.contains("badpassword")
+                                || err_lower.contains("passwordrequired");
 
-                        if is_password_err {
-                            self.is_encrypted = true;
-                            self.request_password_focus = true;
-                            self.status_message = String::from("Archive is password protected");
-                        } else {
-                            self.status_message = format!("Error: {}", err_text);
+                            if is_password_err {
+                                // Listing failed because the archive is password-protected.
+                                Ok(LoadedArchive {
+                                    is_encrypted: true,
+                                    entries: Vec::new(),
+                                })
+                            } else {
+                                Err(e)
+                            }
                         }
-                    }
-                }
+                    };
+
+                    *result.lock().unwrap() = Some(outcome);
+                }));
             }
             None => {
                 self.status_message = format!("Unknown format: {}", path.display());
             }
         }
+    }
 
-        // Set default destination
+    fn set_default_destination(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
             let mut dest = parent.to_path_buf();
             if let Some(format) = self.archive_format {
@@ -261,14 +281,15 @@ impl ArchiveExtractorApp {
         info!("Starting extraction to {:?}", dest_path);
 
         let handle = thread::spawn(move || {
-            let result = extractor::extract_archive(
-                &archive_path,
-                &dest_path,
-                progress_current,
-                progress_total,
+            let ctx = extractor::ExtractionContext {
+                path: &archive_path,
+                dest: &dest_path,
+                progress: progress_current,
+                total: progress_total,
                 cancel_flag,
-                password.as_deref(),
-            );
+                password: password.as_deref(),
+            };
+            let result = extractor::extract_archive(&ctx);
             if let Err(e) = result {
                 let err_str = format!("{:#}", e);
                 error!("Extraction failed: {}", err_str);
@@ -350,6 +371,75 @@ impl ArchiveExtractorApp {
                     self.extraction_status = String::from("Done!");
                     self.status_message = format!("Extraction complete{}", total_time_str);
                 }
+            }
+        }
+    }
+
+    /// Poll for completion of the background archive loading thread and
+    /// merge the result (encryption status + entry list) into UI state.
+    fn update_loading_status(&mut self) {
+        if !self.is_loading {
+            return;
+        }
+
+        if let Some(handle) = &self.loading_handle {
+            if !handle.is_finished() {
+                return;
+            }
+        }
+
+        self.is_loading = false;
+        self.loading_handle = None;
+
+        let outcome = self.loading_result.lock().unwrap().take();
+        match outcome {
+            Some(Ok(loaded)) => {
+                self.is_encrypted = loaded.is_encrypted;
+                self.archive_entries = loaded.entries;
+                self.update_filtered_entries();
+
+                if self.archive_entries.is_empty() && !self.is_encrypted {
+                    self.status_message =
+                        String::from("No files found in archive");
+                } else if self.is_encrypted {
+                    self.request_password_focus = true;
+                    self.status_message = if self.archive_entries.is_empty() {
+                        String::from("Archive is password protected")
+                    } else {
+                        format!(
+                            "{} files · {}  (password protected)",
+                            self.archive_entries.len(),
+                            formats::format_size(self.total_size())
+                        )
+                    };
+                } else {
+                    self.status_message = format!(
+                        "{} files · {} ",
+                        self.archive_entries.len(),
+                        formats::format_size(self.total_size())
+                    );
+                }
+            }
+            Some(Err(e)) => {
+                let err_text = e.to_string();
+                error!("Failed to load archive: {}", err_text);
+                let err_lower = err_text.to_lowercase();
+                if err_lower.contains("password")
+                    || err_lower.contains("decrypt")
+                    || err_lower.contains("badpassword")
+                    || err_lower.contains("passwordrequired")
+                {
+                    self.is_encrypted = true;
+                    self.request_password_focus = true;
+                    self.status_message =
+                        String::from("Archive is password protected");
+                } else {
+                    self.status_message = format!("Error: {}", err_text);
+                }
+            }
+            None => {
+                // Thread finished but didn't set a result (shouldn't happen)
+                self.status_message = String::from("Failed to load archive");
             }
         }
     }
@@ -714,8 +804,19 @@ impl ArchiveExtractorApp {
 
             ui.add_space(16.0);
 
-            // File list header
-            if !self.archive_entries.is_empty() {
+            // File list header — show spinner while background loading is active
+            if self.is_loading && self.archive_entries.is_empty() {
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("Loading archive…")
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(160, 160, 170)),
+                    );
+                });
+                ui.add_space(10.0);
+            } else if !self.archive_entries.is_empty() {
                 ui.horizontal(|ui| {
                     let total = self.archive_entries.len();
                     let showing = if self.search_query.is_empty() {
@@ -949,7 +1050,8 @@ impl ArchiveExtractorApp {
 impl eframe::App for ArchiveExtractorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_extraction_status();
-        if self.is_extracting {
+        self.update_loading_status();
+        if self.is_extracting || self.is_loading {
             ctx.request_repaint();
         }
 

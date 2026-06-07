@@ -119,14 +119,15 @@ fn run_extract(
     let progress_clone = Arc::clone(&progress);
     let total_clone = Arc::clone(&total);
 
-    let result = extractor::extract_archive(
-        archive,
-        &dest,
-        progress_clone,
-        total_clone,
-        cancel,
+    let ctx = extractor::ExtractionContext {
+        path: archive,
+        dest: &dest,
+        progress: progress_clone,
+        total: total_clone,
+        cancel_flag: cancel,
         password,
-    );
+    };
+    let result = extractor::extract_archive(&ctx);
 
     match result {
         Ok(count) => {
