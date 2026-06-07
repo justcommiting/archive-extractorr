@@ -15,6 +15,24 @@ use xz2::read::XzDecoder;
 use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
+/// Copy data from reader to writer using a caller-supplied buffer,
+/// replacing the default 8 KB buffer used by `io::copy`.
+fn copy_buffered<R: Read + ?Sized, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut [u8],
+) -> io::Result<u64> {
+    let mut total = 0;
+    loop {
+        let n = reader.read(buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+}
+
 /// Helper to sanitize and validate target paths to prevent directory traversal
 fn sanitize_target_path(dest: &Path, entry_path: &Path) -> Result<PathBuf> {
     let mut safe_path = PathBuf::new();
@@ -129,10 +147,13 @@ fn extract_single_file<D: Read>(
     }
 
     let out_path = ctx.dest.join(&output_name);
-    let mut outfile =
-        BufWriter::new(File::create(&out_path).context("Failed to create output file")?);
+    let mut outfile = BufWriter::with_capacity(
+        64 * 1024,
+        File::create(&out_path).context("Failed to create output file")?,
+    );
 
-    io::copy(&mut decoder, &mut outfile)
+    let mut buf = vec![0u8; 256 * 1024];
+    copy_buffered(&mut decoder, &mut outfile, &mut buf)
         .with_context(|| format!("Failed to decompress {} file", format_label))?;
     outfile.flush().context("Failed to flush output file")?;
 
@@ -377,8 +398,14 @@ impl DirTracker {
     }
 }
 
-const CHUNK_SIZE: usize = 128;
-const CHUNK_THRESHOLD: usize = 128;
+/// Compute an adaptive chunk size for parallel ZIP extraction.
+/// Targets roughly one chunk per CPU to balance load with minimal overhead.
+fn zip_chunk_size(total_files: usize) -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (total_files / cpus).clamp(64, 2048)
+}
 
 /// Extract a range of entries from a ZIP archive. Used by both the
 /// single-threaded fast path and the parallel chunked path.
@@ -390,6 +417,7 @@ fn extract_zip_entries(
 ) -> Result<()> {
     let mut archive =
         ZipArchive::new(std::io::Cursor::new(bytes)).context("Invalid ZIP archive")?;
+    let mut buf = vec![0u8; 256 * 1024];
 
     for &i in indices {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
@@ -423,10 +451,11 @@ fn extract_zip_entries(
         } else {
             created_dirs.ensure_parent(&out_path)?;
 
-            let mut outfile = BufWriter::new(
+            let mut outfile = BufWriter::with_capacity(
+                64 * 1024,
                 File::create(&out_path).context("Failed to create output file")?,
             );
-            io::copy(&mut entry, &mut outfile).context("Failed to extract file")?;
+            copy_buffered(&mut entry, &mut outfile, &mut buf).context("Failed to extract file")?;
             outfile.flush().context("Failed to flush output file")?;
         }
 
@@ -459,12 +488,13 @@ pub fn extract_zip(ctx: &ExtractionContext) -> Result<usize> {
     let created_dirs = DirTracker::new();
     let bytes: &[u8] = &data;
 
-    if total_files < CHUNK_THRESHOLD {
+    if total_files < 64 {
         let indices: Vec<usize> = (0..total_files).collect();
         extract_zip_entries(bytes, ctx, &indices, &created_dirs)?;
     } else {
+        let chunk_size = zip_chunk_size(total_files);
         let indices: Vec<usize> = (0..total_files).collect();
-        let chunks: Vec<&[usize]> = indices.chunks(CHUNK_SIZE).collect();
+        let chunks: Vec<&[usize]> = indices.chunks(chunk_size).collect();
 
         chunks.into_par_iter().try_for_each(|chunk| {
             if ctx.cancel_flag.load(Ordering::Relaxed) {
@@ -547,6 +577,7 @@ pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
 
     let mut extracted = 0;
     let created_dirs = DirTracker::new();
+    let mut buf = vec![0u8; 256 * 1024];
 
     let res = reader.for_each_entries(|entry, file_reader| {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
@@ -566,9 +597,11 @@ pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
                 .ensure_parent(&out_path)
                 .map_err(|e| sevenz_rust::Error::other(format!("{:#}", e)))?;
 
-            let mut outfile =
-                BufWriter::new(File::create(&out_path).map_err(sevenz_rust::Error::io)?);
-            std::io::copy(file_reader, &mut outfile).map_err(sevenz_rust::Error::io)?;
+            let mut outfile = BufWriter::with_capacity(
+                64 * 1024,
+                File::create(&out_path).map_err(sevenz_rust::Error::io)?,
+            );
+            copy_buffered(file_reader, &mut outfile, &mut buf).map_err(sevenz_rust::Error::io)?;
             outfile.flush().map_err(sevenz_rust::Error::io)?;
         }
 
