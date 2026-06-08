@@ -1,40 +1,36 @@
 # Archive Extractor
 
-A cross-platform archive extractor with a modern, beautiful GUI built with Rust and egui.
+A cross-platform archive extractor with a modern, human-friendly GUI built with Rust and egui.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
-![Tests](https://github.com/justcommiting/archive-extractorr/workflows/Release/badge.svg)
+![Tests](https://github.com/justcommitting/archive-extractorr/workflows/Release/badge.svg)
 
 ## Features
 
-- **Modern GUI**: Clean, dark-themed interface built with egui
+- **Human-friendly UI**: Contextual greeting, natural language messages, ETA, and animations
 - **Cross-Platform**: Works on Windows, macOS, and Linux
-- **Drag & Drop**: Simply drag archive files onto the window
+- **Drag & Drop**: Animated drop zone with visual feedback
 - **Multiple Formats**: Support for popular archive formats:
-  - ZIP (.zip)
-  - TAR (.tar)
-  - GZIP (.gz)
-  - BZIP2 (.bz2)
-  - XZ (.xz)
-  - RAR (.rar)
-- **Real-time Progress**: Visual progress bar during extraction
+  - ZIP (.zip), TAR (.tar), GZIP (.gz), BZIP2 (.bz2)
+  - XZ (.xz), RAR (.rar), 7z (.7z), Zstandard (.zst)
+  - Brotli (.br), LZ4 (.lz4)
+- **Real-time Progress**: Progress bar with ETA and speed display
+- **Password-protected Archives**: Gentle password prompt with helpful hints
 - **File Preview**: Browse archive contents before extracting
 - **Search**: Quick search through archive contents
+- **Sorting**: Sort by name, size, or type with helpful tooltips
+- **Cancel Confirmation**: Prevents accidental cancellation during extraction
 - **Theme Toggle**: Switch between dark and light themes
+- **Keyboard Shortcuts**: Ctrl+O (open), Ctrl+D (destination), Ctrl+E (extract)
 
 ## Installation
 
 ### From Source
 
 ```bash
-# Clone or navigate to the project directory
 cd archive-extractor
-
-# Build in release mode
 cargo build --release
-
-# Run the application
 cargo run --release
 ```
 
@@ -43,7 +39,7 @@ cargo run --release
 Pre-built binaries are available for:
 - **Windows**: `archive-extractor.exe`
 - **macOS**: `archive-extractor.app`
-- **Linux**: `archive-extractor` (AppImage coming soon)
+- **Linux**: `archive-extractor`
 
 ## Usage
 
@@ -55,14 +51,13 @@ Run without arguments to launch the graphical interface:
 ./target/release/archive-extractor
 ```
 
-1. **Open an Archive**: Click "Open Archive" or drag and drop an archive file
-2. **Browse Contents**: View the files inside the archive
-3. **Select Destination**: Choose where to extract files
-4. **Extract**: Click the "Extract" button to extract all files
+1. **Drop or Open**: Drag an archive onto the animated drop zone, or click "Browse Files"
+2. **Browse Contents**: View files inside the archive with size details
+3. **Choose Destination**: Select where to extract files
+4. **Extract**: Click "Extract" and watch the progress with ETA
+5. **Done!** Open the destination folder directly or extract another archive
 
 ### CLI Mode
-
-The CLI supports three commands:
 
 ```bash
 # Extract an archive
@@ -89,28 +84,7 @@ archive-extractor extract archive.zip -v
 | `Ctrl+D` / `Cmd+D` | Select destination folder |
 | `Ctrl+E` / `Cmd+E` | Extract |
 | `Ctrl+Q` / `Cmd+Q` | Quit |
-| `Escape` | Cancel extraction |
-
-## Building for Production
-
-### Windows
-
-```bash
-cargo build --release --target x86_64-pc-windows-msvc
-```
-
-### macOS
-
-```bash
-cargo build --release --target x86_64-apple-darwin
-cargo build --release --target aarch64-apple-darwin  # Apple Silicon
-```
-
-### Linux
-
-```bash
-cargo build --release --target x86_64-unknown-linux-gnu
-```
+| `Escape` | Cancel extraction (with confirmation) |
 
 ## Project Structure
 
@@ -119,13 +93,13 @@ archive-extractor/
 ├── Cargo.toml          # Project dependencies
 ├── src/
 │   ├── main.rs         # Application entry point (GUI + CLI)
-│   ├── app.rs          # Main application logic
+│   ├── app.rs          # Main application logic and UI
 │   ├── cli.rs          # Command-line interface
 │   ├── extractor.rs    # Archive extraction engine
 │   ├── formats.rs      # Format detection and utilities
 │   └── ui/
 │       ├── mod.rs      # UI module exports
-│       └── theme.rs    # Theme configuration
+│       └── theme.rs    # Theme configuration (dark/light)
 ├── assets/
 │   └── icon.png        # Application icon
 └── README.md
@@ -143,17 +117,12 @@ archive-extractor/
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License.
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## Security
 
 See [SECURITY.md](SECURITY.md) for reporting security vulnerabilities.
-
-## Acknowledgments
-
-- [egui](https://github.com/emilk/egui) - The immediate mode GUI framework
-- [rfd](https://github.com/PolyMeilex/rfd) - Rust File Dialog

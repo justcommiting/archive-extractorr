@@ -97,6 +97,13 @@ pub struct ArchiveExtractorApp {
     extraction_start_time: Option<std::time::Instant>,
     extraction_speed: String,
     extraction_elapsed: String,
+    extraction_eta: String,
+
+    // UI micro-interactions
+    button_cooldown_until: Option<std::time::Instant>,
+    extraction_finished_at: Option<std::time::Instant>,
+    show_cancel_dialog: bool,
+    drag_hover: bool,
 
     // Background loading: encryption check + listing off the UI thread
     is_loading: bool,
@@ -139,6 +146,11 @@ impl Default for ArchiveExtractorApp {
             extraction_start_time: None,
             extraction_speed: String::new(),
             extraction_elapsed: String::new(),
+            extraction_eta: String::new(),
+            button_cooldown_until: None,
+            extraction_finished_at: None,
+            show_cancel_dialog: false,
+            drag_hover: false,
             is_loading: false,
             loading_handle: None,
             loading_result: Arc::new(Mutex::new(None)),
@@ -256,6 +268,18 @@ impl ArchiveExtractorApp {
 
     fn total_size(&self) -> u64 {
         self.archive_entries.iter().map(|e| e.size).sum()
+    }
+
+    fn human_summary(&self) -> String {
+        let total_size = self.total_size();
+        let file_count = self.archive_entries.len();
+        if total_size > 1_000_000_000 {
+            format!("{:.1} GB across {} files", total_size as f64 / 1e9, file_count)
+        } else if total_size > 1_000_000 {
+            format!("{:.1} MB across {} files", total_size as f64 / 1e6, file_count)
+        } else {
+            format!("{} files", file_count)
+        }
     }
 
     fn rebuild_sort_keys(&mut self) {
@@ -405,6 +429,24 @@ impl ArchiveExtractorApp {
                 let speed = current as f64 / elapsed_secs;
                 self.extraction_speed = format!("{:.1} files/s", speed);
             }
+
+            // ETA
+            if elapsed_secs > 1.0 && current > 0 && total > 0 {
+                let fraction = current as f64 / total as f64;
+                if fraction > 0.01 {
+                    let total_est = elapsed_secs / fraction;
+                    let remaining = total_est - elapsed_secs;
+                    if remaining > 0.0 {
+                        self.extraction_eta = if remaining < 60.0 {
+                            format!("~{} secs left", remaining as u64)
+                        } else if remaining < 3600.0 {
+                            format!("~{} min left", (remaining / 60.0) as u64)
+                        } else {
+                            format!("~{} hrs left", (remaining / 3600.0) as u64)
+                        };
+                    }
+                }
+            }
         }
 
         if let Some(handle) = &self.extraction_handle {
@@ -422,22 +464,29 @@ impl ArchiveExtractorApp {
                 let err = self.error_message.lock().unwrap().take();
                 if let Some(err_msg) = err {
                     let err_lower = err_msg.to_lowercase();
-                    let is_password_err = err_lower.contains("password")
-                        || err_lower.contains("invalid password")
-                        || err_lower.contains("decrypt");
+                    let is_cancelled = err_lower.contains("cancelled");
+                    let is_password_err = !is_cancelled
+                        && (err_lower.contains("password")
+                            || err_lower.contains("invalid password")
+                            || err_lower.contains("decrypt"));
 
                     if is_password_err {
                         // Password error — allow retry
                         self.password_error = true;
                         self.extraction_progress = 0.0;
                         self.extraction_status = String::from("Extraction failed");
-                        self.status_message = format!("✗ Error: {}", err_msg);
+                        self.status_message = format!("🔐 Hmm, that password didn't work. Try again? ({})", err_msg);
                         error!("Password error: {}", err_msg);
+                    } else if is_cancelled {
+                        self.extraction_progress = 0.0;
+                        self.extraction_status = String::from("Stopped");
+                        self.status_message = String::from("Stopped – you can try again with different settings.");
+                        info!("Extraction cancelled by user");
                     } else {
                         // Other error — show message but keep progress visible
                         self.extraction_progress = 100.0;
                         self.extraction_status = String::from("Failed");
-                        self.status_message = format!("✗ Error: {}", err_msg);
+                        self.status_message = format!("Something went wrong: {}", err_msg);
                         error!("Extraction failed: {}", err_msg);
                     }
                 } else {
@@ -445,6 +494,7 @@ impl ArchiveExtractorApp {
                     self.extraction_progress = 100.0;
                     self.extraction_status = String::from("Done!");
                     self.status_message = format!("Extraction complete{}", total_time_str);
+                    self.extraction_finished_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -475,23 +525,21 @@ impl ArchiveExtractorApp {
                 self.sort_entries();
 
                 if self.archive_entries.is_empty() && !self.is_encrypted {
-                    self.status_message = String::from("No files found in archive");
+                    self.status_message = String::from("This archive appears to be empty. Are you sure it's the right file?");
                 } else if self.is_encrypted {
                     self.request_password_focus = true;
                     self.status_message = if self.archive_entries.is_empty() {
-                        String::from("Archive is password protected")
+                        String::from("🔒 This archive is locked. Enter the password to unlock.")
                     } else {
                         format!(
-                            "{} files · {}  (password protected)",
-                            self.archive_entries.len(),
-                            formats::format_size(self.total_size())
+                            "{}  ·  password protected. Enter the password below.",
+                            self.human_summary()
                         )
                     };
                 } else {
                     self.status_message = format!(
-                        "{} files · {} ",
-                        self.archive_entries.len(),
-                        formats::format_size(self.total_size())
+                        "This archive contains: {}",
+                        self.human_summary()
                     );
                 }
             }
@@ -518,11 +566,31 @@ impl ArchiveExtractorApp {
         }
     }
 
+    fn greeting(&self) -> &str {
+        if self.is_loading {
+            "🔍 Looking inside…"
+        } else if self.archive_path.is_none() {
+            "👋 Ready to unpack something?"
+        } else if self.is_extracting {
+            "⚡ Unpacking… hang tight"
+        } else if self.extraction_progress >= 100.0 && self.extraction_finished_at.is_some() {
+            "✅ All done! Want to open another?"
+        } else if self.password_error {
+            "🔐 Let's try a different password"
+        } else if self.is_encrypted {
+            "🔒 Got the key? Enter it below"
+        } else if !self.archive_entries.is_empty() {
+            "📦 Ready to extract"
+        } else {
+            "📂 Archive loaded"
+        }
+    }
+
     fn ui_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Archive Extractor")
-                    .size(22.0)
+                egui::RichText::new(self.greeting())
+                    .size(18.0)
                     .color(egui::Color32::WHITE),
             );
 
@@ -563,18 +631,22 @@ impl ArchiveExtractorApp {
                             .color(egui::Color32::WHITE),
                         );
                         if let Some(fmt) = self.archive_format {
-                            let mut info_text = format!(
-                                "{} {} ",
-                                formats::format_icon(fmt),
-                                formats::format_name(fmt)
-                            );
-                            if self.is_encrypted {
-                                info_text.push_str(" [Encrypted] ");
-                            }
                             ui.label(
-                                egui::RichText::new(info_text)
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    formats::format_icon(fmt),
+                                    formats::format_name(fmt)
+                                ))
+                                .size(12.0)
+                                .color(egui::Color32::GRAY),
+                            );
+                        }
+                        if !self.archive_entries.is_empty() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(self.human_summary())
                                     .size(12.0)
-                                    .color(egui::Color32::GRAY),
+                                    .color(egui::Color32::from_rgb(150, 200, 150)),
                             );
                         }
                     } else {
@@ -610,7 +682,11 @@ impl ArchiveExtractorApp {
                                 self.destination_path = Some(PathBuf::from(&self.destination_edit));
                             }
 
-                            if ui.button("Browse").clicked() {
+                            if ui
+                                .button("Browse")
+                                .on_hover_text("Choose where to save the extracted files")
+                                .clicked()
+                            {
                                 if let Some(path) = pick_folder() {
                                     self.destination_path = Some(path.clone());
                                     self.destination_edit = path.display().to_string();
@@ -636,24 +712,28 @@ impl ArchiveExtractorApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 10.0));
                 frame.show(ui, |ui| {
                     let pass_color = if self.password_error {
-                        egui::Color32::from_rgb(240, 120, 120)
+                        egui::Color32::from_rgb(255, 180, 180)
                     } else {
-                        egui::Color32::from_rgb(220, 190, 80)
-                    };
-                    let pass_label = if self.password_error {
-                        "Password required (incorrect)"
-                    } else {
-                        "This archive is password protected"
+                        egui::Color32::from_rgb(200, 200, 160)
                     };
 
-                    ui.horizontal(|ui| {
+                    if self.password_error {
                         ui.label(
-                            egui::RichText::new("[LOCKED] ")
-                                .size(13.0)
-                                .color(pass_color),
+                            egui::RichText::new(
+                                "🔐 Hmm, that password didn't work. Try again?",
+                            )
+                            .size(13.0)
+                            .color(pass_color),
                         );
-                        ui.label(egui::RichText::new(pass_label).size(13.0).color(pass_color));
-                    });
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "🔒 This archive is locked. Enter the password to unlock.",
+                            )
+                            .size(13.0)
+                            .color(pass_color),
+                        );
+                    }
 
                     ui.add_space(6.0);
 
@@ -714,67 +794,76 @@ impl ArchiveExtractorApp {
 
             // Progress bar (during extraction)
             if self.is_extracting || self.extraction_progress > 0.0 {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_premultiplied(40, 50, 60, 40))
-                    .rounding(egui::Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    ui.available_size()
-                                        - egui::vec2(
-                                            if self.is_extracting { 90.0 } else { 0.0 },
-                                            0.0,
-                                        ),
-                                    egui::ProgressBar::new(self.extraction_progress / 100.0)
-                                        .desired_width(ui.available_size().x)
-                                        .show_percentage()
-                                        .text(&self.extraction_status)
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let progress_frac = self.extraction_progress / 100.0;
+                        let progress_color = if self.extraction_progress >= 100.0 {
+                            egui::Color32::from_rgb(80, 200, 100)
+                        } else {
+                            egui::Color32::from_rgb(60, 140, 220)
+                        };
+                        ui.add_sized(
+                            ui.available_size()
+                                - egui::vec2(
+                                    if self.is_extracting { 90.0 } else { 0.0 },
+                                    0.0,
+                                ),
+                            egui::ProgressBar::new(progress_frac)
+                                .desired_width(ui.available_size().x)
+                                .fill(progress_color)
+                                .show_percentage()
+                                .text(&self.extraction_status)
+                                .rounding(egui::Rounding::same(4.0)),
+                        );
+
+                        if self.is_extracting
+                            && ui
+                                .add(
+                                    egui::Button::new("Cancel")
+                                        .min_size(egui::vec2(80.0, 24.0))
                                         .rounding(egui::Rounding::same(4.0)),
-                                );
+                                )
+                                .on_hover_text("Esc")
+                                .clicked()
+                        {
+                            self.show_cancel_dialog = true;
+                        }
+                    });
 
-                                if self.is_extracting
-                                    && ui
-                                        .add(
-                                            egui::Button::new("Cancel")
-                                                .min_size(egui::vec2(80.0, 24.0))
-                                                .rounding(egui::Rounding::same(4.0)),
-                                        )
-                                        .on_hover_text("Esc")
-                                        .clicked()
-                                {
-                                    self.cancel_flag.store(true, Ordering::Relaxed);
-                                }
-                            });
-
-                            if self.is_extracting {
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Elapsed: {}",
-                                            self.extraction_elapsed
-                                        ))
+                    if self.is_extracting {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Elapsed: {}",
+                                    self.extraction_elapsed
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::GRAY),
+                            );
+                            ui.add_space(12.0);
+                            if !self.extraction_eta.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&self.extraction_eta)
                                         .size(11.0)
-                                        .color(egui::Color32::GRAY),
-                                    );
-                                    ui.add_space(16.0);
-                                    if !self.extraction_speed.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "Speed: {}",
-                                                self.extraction_speed
-                                            ))
-                                            .size(11.0)
-                                            .color(egui::Color32::GRAY),
-                                        );
-                                    }
-                                });
+                                        .color(egui::Color32::from_rgb(160, 200, 160)),
+                                );
+                                ui.add_space(12.0);
+                            }
+                            if !self.extraction_speed.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Speed: {}",
+                                        self.extraction_speed
+                                    ))
+                                    .size(11.0)
+                                    .color(egui::Color32::GRAY),
+                                );
                             }
                         });
-                    });
-                ui.add_space(10.0);
+                    }
+                });
+                ui.add_space(8.0);
             }
 
             ui.add_space(8.0);
@@ -828,8 +917,14 @@ impl ArchiveExtractorApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let on_cooldown = self.button_cooldown_until
+                            .map(|t| t > std::time::Instant::now())
+                            .unwrap_or(false);
                         let needs_password = self.is_encrypted && self.password.is_empty();
-                        let extract_label = if needs_password {
+                        let disabled = needs_password || on_cooldown;
+                        let extract_label = if on_cooldown {
+                            "✓ Extracting…"
+                        } else if needs_password {
                             "Locked Extract"
                         } else {
                             "Extract"
@@ -837,12 +932,16 @@ impl ArchiveExtractorApp {
                         let btn = egui::Button::new(
                             egui::RichText::new(extract_label)
                                 .size(14.0)
-                                .color(egui::Color32::WHITE),
+                                .color(if disabled {
+                                    egui::Color32::from_rgb(160, 160, 160)
+                                } else {
+                                    egui::Color32::WHITE
+                                }),
                         )
                         .min_size(egui::vec2(110.0, 36.0))
                         .rounding(egui::Rounding::same(6.0))
-                        .fill(if needs_password {
-                            egui::Color32::from_rgb(80, 80, 90)
+                        .fill(if disabled {
+                            egui::Color32::from_rgb(60, 70, 60)
                         } else {
                             egui::Color32::from_rgb(60, 140, 80)
                         });
@@ -855,9 +954,11 @@ impl ArchiveExtractorApp {
                                 "Ctrl+E"
                             })
                             .clicked()
-                            && !needs_password
+                            && !disabled
                         {
                             self.start_extraction();
+                            self.button_cooldown_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
                         }
                     });
                 } else if self.extraction_progress >= 100.0 {
@@ -877,12 +978,33 @@ impl ArchiveExtractorApp {
                     ui.add_space(8.0);
 
                     if let Some(ref dest) = self.destination_path {
+                        // Subtle green glow on completion, fades over ~3 seconds
+                        let glow_alpha: u8 = self.extraction_finished_at
+                            .map(|t| {
+                                let elapsed = t.elapsed().as_secs_f64();
+                                if elapsed < 1.0 {
+                                    80
+                                } else if elapsed < 3.0 {
+                                    (80.0 * (1.0 - (elapsed - 1.0) / 2.0)) as u8
+                                } else {
+                                    0
+                                }
+                            })
+                            .unwrap_or(0);
+                        let glow_color = egui::Color32::from_rgba_premultiplied(60, 220, 80, glow_alpha);
+
                         if ui
                             .add(
-                                egui::Button::new("Open Destination")
-                                    .min_size(egui::vec2(140.0, 32.0))
-                                    .rounding(egui::Rounding::same(6.0)),
+                                egui::Button::new(
+                                    egui::RichText::new("Open Destination")
+                                        .size(13.0)
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .min_size(egui::vec2(140.0, 32.0))
+                                .rounding(egui::Rounding::same(6.0))
+                                .fill(glow_color),
                             )
+                            .on_hover_text("Open the folder where files were extracted")
                             .clicked()
                         {
                             open_path(dest);
@@ -958,18 +1080,21 @@ impl ArchiveExtractorApp {
                     let mut sort_clicked = None;
                     if ui
                         .selectable_label(self.sort_by == SortBy::Name, "Name")
+                        .on_hover_text("Sort files alphabetically")
                         .clicked()
                     {
                         sort_clicked = Some(SortBy::Name);
                     }
                     if ui
                         .selectable_label(self.sort_by == SortBy::Size, "Size")
+                        .on_hover_text("Sort by file size, smallest first")
                         .clicked()
                     {
                         sort_clicked = Some(SortBy::Size);
                     }
                     if ui
                         .selectable_label(self.sort_by == SortBy::Type, "Type")
+                        .on_hover_text("Groups folders first, then files by extension")
                         .clicked()
                     {
                         sort_clicked = Some(SortBy::Type);
@@ -1008,7 +1133,9 @@ impl ArchiveExtractorApp {
                             ui.horizontal(|ui| {
                                 ui.add_space(10.0);
                                 ui.label(
-                                    egui::RichText::new("No files match your search")
+                                    egui::RichText::new(
+                                        "Nothing matches your search — try different keywords?"
+                                    )
                                         .size(13.0)
                                         .color(egui::Color32::from_rgb(140, 140, 150)),
                                 );
@@ -1073,21 +1200,53 @@ impl ArchiveExtractorApp {
 
     fn ui_drop_zone(&mut self, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| {
+            // Detect drag hover for pulsing border animation
+            let hovered = !ui.ctx().input(|i| i.raw.hovered_files.is_empty());
+            self.drag_hover = hovered;
+
+            let border_color = if hovered {
+                let phase = ui.ctx().input(|i| i.time) * 2.0;
+                let pulse = ((phase.sin() + 1.0) / 2.0 * 0.5 + 0.5) as f32;
+                egui::Color32::from_rgb(
+                    (60.0 + 120.0 * pulse) as u8,
+                    (160.0 + 80.0 * pulse) as u8,
+                    (220.0 * pulse) as u8,
+                )
+            } else {
+                egui::Color32::from_rgba_premultiplied(60, 100, 160, 30)
+            };
+
+            let bg_color = if hovered {
+                egui::Color32::from_rgba_premultiplied(40, 50, 70, 80)
+            } else {
+                egui::Color32::from_rgba_premultiplied(35, 35, 45, 50)
+            };
+
+            let border_width = if hovered { 2.5 } else { 1.0 };
+
             egui::Frame::none()
-                .fill(egui::Color32::from_rgba_premultiplied(35, 35, 45, 50))
+                .fill(bg_color)
                 .rounding(egui::Rounding::same(16.0))
+                .stroke(egui::Stroke::new(border_width, border_color))
                 .inner_margin(egui::Margin::symmetric(40.0, 30.0))
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(20.0);
 
-                        // Large text heading
-                        ui.label(
-                            egui::RichText::new("[ ARCHIVE EXTRACTOR ]")
-                                .size(28.0)
-                                .color(egui::Color32::from_rgb(150, 180, 220))
-                                .strong(),
-                        );
+                        if hovered {
+                            ui.label(
+                                egui::RichText::new("🎯 Drop it right here!")
+                                    .size(28.0)
+                                    .color(egui::Color32::from_rgb(180, 220, 255))
+                                    .strong(),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("📦")
+                                    .size(28.0)
+                                    .color(egui::Color32::from_rgb(150, 180, 220)),
+                            );
+                        }
 
                         ui.add_space(12.0);
 
@@ -1118,7 +1277,7 @@ impl ArchiveExtractorApp {
                                 .rounding(egui::Rounding::same(8.0))
                                 .fill(egui::Color32::from_rgb(60, 100, 160)),
                             )
-                            .on_hover_text("Ctrl+O")
+                            .on_hover_text("Choose where to save the extracted files")
                             .clicked()
                         {
                             if let Some(path) = pick_file() {
@@ -1151,6 +1310,39 @@ impl ArchiveExtractorApp {
             );
         });
     }
+
+    fn ui_cancel_dialog(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Stop extraction?")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("You can resume by starting over.")
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(180, 180, 180)),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Keep Extracting").clicked() {
+                        self.show_cancel_dialog = false;
+                    }
+                    ui.add_space(12.0);
+                    if ui
+                        .add(
+                            egui::Button::new("Yes, stop")
+                                .fill(egui::Color32::from_rgb(180, 60, 60))
+                                .min_size(egui::vec2(100.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.cancel_flag.store(true, Ordering::Relaxed);
+                        self.show_cancel_dialog = false;
+                    }
+                });
+            });
+    }
 }
 
 impl Drop for ArchiveExtractorApp {
@@ -1169,7 +1361,15 @@ impl eframe::App for ArchiveExtractorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_extraction_status();
         self.update_loading_status();
-        if self.is_extracting || self.is_loading {
+
+        // Keep repainting during active operations and animations
+        let needs_repaint = self.is_extracting
+            || self.is_loading
+            || self.drag_hover
+            || self.show_cancel_dialog
+            || self.button_cooldown_until.map_or(false, |t| t > std::time::Instant::now())
+            || self.extraction_finished_at.map_or(false, |t| t.elapsed().as_secs_f64() < 3.0);
+        if needs_repaint {
             ctx.request_repaint();
         }
 
@@ -1204,9 +1404,9 @@ impl eframe::App for ArchiveExtractorApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // Escape: Cancel extraction
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.is_extracting {
-            self.cancel_flag.store(true, Ordering::Relaxed);
+        // Escape: Show cancel confirmation instead of cancelling immediately
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.is_extracting && !self.show_cancel_dialog {
+            self.show_cancel_dialog = true;
         }
 
         // Handle drag and drop
@@ -1215,9 +1415,14 @@ impl eframe::App for ArchiveExtractorApp {
                 if formats::is_supported_archive(&path) {
                     self.set_archive(path);
                 } else {
-                    self.status_message = String::from("Not a supported archive format");
+                    self.status_message = String::from("Hmm, that file type isn't supported. Try ZIP, TAR, RAR, 7z, or similar.");
                 }
             }
+        }
+
+        // Cancel confirmation dialog
+        if self.show_cancel_dialog {
+            self.ui_cancel_dialog(ctx);
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
