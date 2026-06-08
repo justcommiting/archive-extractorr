@@ -37,6 +37,11 @@ pub struct Cli {
     /// Password for encrypted archives
     #[arg(short, long)]
     pub password: Option<String>,
+
+    /// Only extract specific files (by path within the archive).
+    /// Can be specified multiple times for multiple files.
+    #[arg(short = 'f', long = "files", value_name = "FILE_PATHS")]
+    pub files: Vec<String>,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -58,11 +63,17 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
     } else if action_extract {
         use rayon::prelude::*;
+        let files = if cli.files.is_empty() {
+            None
+        } else {
+            Some(cli.files.clone())
+        };
         cli.archives.par_iter().try_for_each(|archive| {
             run_extract(
                 archive,
                 cli.output.as_deref(),
                 cli.password.as_deref(),
+                files.as_deref(),
                 cli.verbose,
             )
         })?;
@@ -75,6 +86,7 @@ fn run_extract(
     archive: &Path,
     output: Option<&Path>,
     password: Option<&str>,
+    files: Option<&[String]>,
     verbose: bool,
 ) -> anyhow::Result<()> {
     if !archive.exists() {
@@ -119,14 +131,15 @@ fn run_extract(
     let progress_clone = Arc::clone(&progress);
     let total_clone = Arc::clone(&total);
 
-    let ctx = extractor::ExtractionContext {
-        path: archive,
-        dest: &dest,
-        progress: progress_clone,
-        total: total_clone,
-        cancel_flag: cancel,
-        password,
-    };
+        let ctx = extractor::ExtractionContext {
+            path: archive,
+            dest: &dest,
+            progress: progress_clone,
+            total: total_clone,
+            cancel_flag: cancel,
+            password,
+            files: files.map(|f| f.to_vec()),
+        };
     let result = extractor::extract_archive(&ctx);
 
     match result {

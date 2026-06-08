@@ -187,6 +187,19 @@ pub struct ExtractionContext<'a> {
     pub total: Arc<AtomicUsize>,
     pub cancel_flag: Arc<AtomicBool>,
     pub password: Option<&'a str>,
+    /// If `Some`, only extract entries whose name (as reported by `ArchiveEntry.name`)
+    /// matches one of these values. Paths are matched exactly (not substrings).
+    /// When `None`, all entries are extracted.
+    pub files: Option<Vec<String>>,
+}
+
+impl ExtractionContext<'_> {
+    pub fn should_extract(&self, name: &str) -> bool {
+        match &self.files {
+            Some(files) => files.iter().any(|f| f == name),
+            None => true,
+        }
+    }
 }
 
 /// Check if a ZIP archive is password protected
@@ -488,12 +501,33 @@ pub fn extract_zip(ctx: &ExtractionContext) -> Result<usize> {
     let created_dirs = DirTracker::new();
     let bytes: &[u8] = &data;
 
-    if total_files < 64 {
-        let indices: Vec<usize> = (0..total_files).collect();
+    // Build index list, filtering by name if ctx.files is set
+    let indices: Vec<usize> = match &ctx.files {
+        Some(files) => {
+            let mut archive =
+                ZipArchive::new(std::io::Cursor::new(bytes)).context("Invalid ZIP archive")?;
+            let mut matched = Vec::new();
+            for i in 0..archive.len() {
+                if let Ok(entry) = archive.by_index(i) {
+                    let name = entry.name().to_string();
+                    if files.iter().any(|f| f == &name) {
+                        matched.push(i);
+                    }
+                }
+            }
+            matched
+        }
+        None => (0..total_files).collect(),
+    };
+
+    if indices.is_empty() && ctx.files.is_some() {
+        anyhow::bail!("No matching files found in archive");
+    }
+
+    if indices.len() < 64 {
         extract_zip_entries(bytes, ctx, &indices, &created_dirs)?;
     } else {
-        let chunk_size = zip_chunk_size(total_files);
-        let indices: Vec<usize> = (0..total_files).collect();
+        let chunk_size = zip_chunk_size(indices.len());
         let chunks: Vec<&[usize]> = indices.chunks(chunk_size).collect();
 
         chunks.into_par_iter().try_for_each(|chunk| {
@@ -504,7 +538,7 @@ pub fn extract_zip(ctx: &ExtractionContext) -> Result<usize> {
         })?;
     }
 
-    Ok(total_files)
+    Ok(indices.len())
 }
 
 /// Extract a TAR archive
@@ -520,11 +554,18 @@ pub fn extract_tar(ctx: &ExtractionContext) -> Result<usize> {
         }
 
         let mut entry = entry.context("Failed to read entry")?;
-        let entry_path = entry
+        let entry_name = entry
             .path()
             .context("Failed to read entry path")?
-            .to_path_buf();
-        let out_path = sanitize_target_path(ctx.dest, &entry_path)?;
+            .to_string_lossy()
+            .to_string();
+
+        if !ctx.should_extract(&entry_name) {
+            continue;
+        }
+
+        let entry_path = Path::new(&entry_name);
+        let out_path = sanitize_target_path(ctx.dest, entry_path)?;
 
         created_dirs.ensure_parent(&out_path)?;
 
@@ -532,6 +573,10 @@ pub fn extract_tar(ctx: &ExtractionContext) -> Result<usize> {
         extracted += 1;
         ctx.progress.fetch_add(1, Ordering::Relaxed);
         ctx.total.store(extracted, Ordering::Relaxed);
+    }
+
+    if extracted == 0 && ctx.files.is_some() {
+        anyhow::bail!("No matching files found in archive");
     }
 
     Ok(extracted)
@@ -582,6 +627,12 @@ pub fn extract_sevenzip(ctx: &ExtractionContext) -> Result<usize> {
     let res = reader.for_each_entries(|entry, file_reader| {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
             return Err(sevenz_rust::Error::other(ExtractionCancelled.to_string()));
+        }
+
+        if !ctx.should_extract(&entry.name) {
+            extracted += 1;
+            ctx.progress.fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
         }
 
         let entry_path = Path::new(&entry.name);
@@ -671,6 +722,13 @@ pub fn extract_rar(ctx: &ExtractionContext) -> Result<usize> {
         };
 
         let header = archive_with_header.entry();
+        let entry_name = header.filename.to_string_lossy().to_string();
+
+        if !ctx.should_extract(&entry_name) {
+            process_archive = archive_with_header.skip().context("Failed to skip entry")?;
+            continue;
+        }
+
         let entry_path = header.filename.clone();
         let out_path = sanitize_target_path(ctx.dest, &entry_path)?;
 
@@ -1000,6 +1058,7 @@ mod tests {
             total,
             cancel_flag: cancel,
             password: None,
+            files: None,
         };
 
         let result = extract_gzip(&ctx);
@@ -1035,6 +1094,7 @@ mod tests {
             total,
             cancel_flag: cancel,
             password: None,
+            files: None,
         };
 
         let result = extract_zip(&ctx);
@@ -1070,6 +1130,7 @@ mod tests {
             total,
             cancel_flag: cancel,
             password: None,
+            files: None,
         };
 
         let result = extract_zip(&ctx);
@@ -1105,6 +1166,7 @@ mod tests {
             total,
             cancel_flag: cancel,
             password: None,
+            files: None,
         };
 
         let result = extract_tar(&ctx);
@@ -1138,6 +1200,7 @@ mod tests {
             total,
             cancel_flag: cancel,
             password: None,
+            files: None,
         };
 
         let result = extract_zip(&ctx);
@@ -1204,6 +1267,7 @@ mod tests {
             total,
             cancel_flag: cancel,
             password: None,
+            files: None,
         };
 
         let result = extract_zip(&ctx);

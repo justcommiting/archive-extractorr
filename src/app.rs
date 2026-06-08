@@ -113,6 +113,9 @@ pub struct ArchiveExtractorApp {
     // Generation counters for stale thread detection
     load_generation: Arc<AtomicU64>,
     extract_generation: Arc<AtomicU64>,
+
+    // Selective extraction
+    selected_entries: std::collections::HashSet<usize>,
 }
 
 impl Default for ArchiveExtractorApp {
@@ -130,6 +133,7 @@ impl Default for ArchiveExtractorApp {
             progress_current: Arc::new(AtomicUsize::new(0)),
             progress_total: Arc::new(AtomicUsize::new(0)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            selected_entries: std::collections::HashSet::new(),
             show_dark_theme: true,
             status_message: String::from("Drop an archive file to begin"),
             destination_edit: String::new(),
@@ -180,6 +184,7 @@ impl ArchiveExtractorApp {
         self.archive_path = Some(path);
         self.archive_entries.clear();
         self.sorted_indices.clear();
+        self.selected_entries.clear();
         self.extraction_start_time = None;
         self.extraction_progress = 0.0;
         self.password.clear();
@@ -374,6 +379,20 @@ impl ArchiveExtractorApp {
 
         info!("Starting extraction to {:?}", dest_path);
 
+        // Build file filter from selected entries
+        let files: Option<Vec<String>> = if self.selected_entries.is_empty() {
+            None
+        } else {
+            Some(
+                self.selected_entries
+                    .iter()
+                    .filter_map(|&i| self.archive_entries.get(i))
+                    .map(|e| e.name.clone())
+                    .collect(),
+            )
+        };
+        let files_count = files.as_ref().map(|f| f.len()).unwrap_or(0);
+
         let gen = self.extract_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let gen_arc = Arc::clone(&self.extract_generation);
 
@@ -385,6 +404,7 @@ impl ArchiveExtractorApp {
                 total: progress_total,
                 cancel_flag,
                 password: password.as_deref(),
+                files,
             };
             let result = extractor::extract_archive(&ctx);
             if let Err(e) = result {
@@ -397,6 +417,11 @@ impl ArchiveExtractorApp {
         });
 
         self.extraction_handle = Some(handle);
+
+        // Update status to reflect selective extraction
+        if files_count > 0 {
+            self.extraction_status = format!("Extracting {} file(s)...", files_count);
+        }
     }
 
     fn update_extraction_status(&mut self) {
@@ -523,6 +548,7 @@ impl ArchiveExtractorApp {
                 self.archive_entries = loaded.entries;
                 self.rebuild_sort_keys();
                 self.sort_entries();
+                self.selected_entries = (0..self.archive_entries.len()).collect();
 
                 if self.archive_entries.is_empty() && !self.is_encrypted {
                     self.status_message = String::from("This archive appears to be empty. Are you sure it's the right file?");
@@ -921,13 +947,16 @@ impl ArchiveExtractorApp {
                             .map(|t| t > std::time::Instant::now())
                             .unwrap_or(false);
                         let needs_password = self.is_encrypted && self.password.is_empty();
+                        let sel_count = self.selected_entries.len();
                         let disabled = needs_password || on_cooldown;
                         let extract_label = if on_cooldown {
                             "✓ Extracting…"
                         } else if needs_password {
                             "Locked Extract"
+                        } else if sel_count > 0 {
+                            "Extract Selected"
                         } else {
-                            "Extract"
+                            "Extract All"
                         };
                         let btn = egui::Button::new(
                             egui::RichText::new(extract_label)
@@ -948,10 +977,14 @@ impl ArchiveExtractorApp {
 
                         if ui
                             .add(btn)
-                            .on_hover_text(if needs_password {
-                                "Enter password first"
-                            } else {
-                                "Ctrl+E"
+                            .on_hover_text({
+                                if needs_password {
+                                    "Enter password first".to_string()
+                                } else if sel_count > 0 {
+                                    format!("Extract {} selected file(s) (Ctrl+E)", sel_count)
+                                } else {
+                                    "Extract all files (Ctrl+E)".to_string()
+                                }
                             })
                             .clicked()
                             && !disabled
@@ -1142,9 +1175,51 @@ impl ArchiveExtractorApp {
                             });
                             ui.add_space(10.0);
                         } else {
+                            // "Select All" toggle row
+                            ui.horizontal(|ui| {
+                                let all_selected = self.sorted_indices.iter().all(|i| self.selected_entries.contains(i));
+                                let label = if all_selected {
+                                    "Deselect all"
+                                } else {
+                                    "Select all"
+                                };
+                                if ui
+                                    .checkbox(&mut true, label)
+                                    .on_hover_text("Toggle selection for all files")
+                                    .clicked()
+                                {
+                                    if all_selected {
+                                        self.sorted_indices.iter().for_each(|i| { self.selected_entries.remove(i); });
+                                    } else {
+                                        self.sorted_indices.iter().for_each(|i| { self.selected_entries.insert(*i); });
+                                    }
+                                }
+                                let sel_count = self.selected_entries.len();
+                                ui.label(
+                                    egui::RichText::new(format!("({} selected)", sel_count))
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(120, 120, 130)),
+                                );
+                                if sel_count > 0 {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Clear selection")
+                                            .on_hover_text("Deselect all files")
+                                            .clicked()
+                                        {
+                                            self.selected_entries.clear();
+                                        }
+                                    });
+                                }
+                            });
+                            ui.add_space(4.0);
+
                             for (idx, &entry_idx) in self.sorted_indices.iter().enumerate() {
                                 let entry = &self.archive_entries[entry_idx];
-                                let bg = if idx % 2 == 0 {
+                                let is_selected = self.selected_entries.contains(&entry_idx);
+
+                                let bg = if is_selected {
+                                    egui::Color32::from_rgba_premultiplied(50, 80, 60, 80)
+                                } else if idx % 2 == 0 {
                                     egui::Color32::from_rgba_premultiplied(30, 30, 38, 80)
                                 } else {
                                     egui::Color32::TRANSPARENT
@@ -1156,6 +1231,14 @@ impl ArchiveExtractorApp {
                                     .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
+                                            let mut checked = is_selected;
+                                            if ui.checkbox(&mut checked, "").changed() {
+                                                if checked {
+                                                    self.selected_entries.insert(entry_idx);
+                                                } else {
+                                                    self.selected_entries.remove(&entry_idx);
+                                                }
+                                            }
                                             ui.label(
                                                 egui::RichText::new(formats::entry_type_label(
                                                     entry,
